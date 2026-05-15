@@ -1,0 +1,52 @@
+services:
+  ideas-bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: "${BOT_TOKEN:?BOT_TOKEN is required}"
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      GROQ_BASE_URL: "${GROQ_BASE_URL:-https://api.groq.com}"
+      ADMIN_TELEGRAM_IDS: "${ADMIN_TELEGRAM_IDS:-}"
+      ALLOWED_TELEGRAM_IDS: "${ALLOWED_TELEGRAM_IDS:-}"
+      ALLOW_ALL_USERS: "${ALLOW_ALL_USERS:-true}"
+      GROQ_TEXT_MODEL: "${GROQ_TEXT_MODEL:-qwen/qwen3-32b}"
+      VOICE_TRANSCRIBER: "${VOICE_TRANSCRIBER:-t_one}"
+      T_ONE_WS_URL: "${T_ONE_WS_URL:-ws://t-one:8080/api/ws}"
+      T_ONE_CONNECT_TIMEOUT_SECONDS: "${T_ONE_CONNECT_TIMEOUT_SECONDS:-20}"
+      T_ONE_RECEIVE_TIMEOUT_SECONDS: "${T_ONE_RECEIVE_TIMEOUT_SECONDS:-30}"
+      T_ONE_FINAL_TIMEOUT_SECONDS: "${T_ONE_FINAL_TIMEOUT_SECONDS:-90}"
+      T_ONE_TOTAL_TIMEOUT_SECONDS: "${T_ONE_TOTAL_TIMEOUT_SECONDS:-240}"
+      T_ONE_MAX_ATTEMPTS: "${T_ONE_MAX_ATTEMPTS:-2}"
+      T_ONE_RETRY_DELAY_SECONDS: "${T_ONE_RETRY_DELAY_SECONDS:-2}"
+      T_ONE_SEND_CHUNK_SECONDS: "${T_ONE_SEND_CHUNK_SECONDS:-5}"
+      T_ONE_AUDIO_FILTER: "${T_ONE_AUDIO_FILTER:-highpass=f=80,lowpass=f=3800,dynaudnorm=f=150:g=15}"
+      FFMPEG_BINARY: "${FFMPEG_BINARY:-ffmpeg}"
+      MEDIA_COMMAND_TIMEOUT_SECONDS: "${MEDIA_COMMAND_TIMEOUT_SECONDS:-180}"
+      VOICE_PROCESSING_TIMEOUT_SECONDS: "${VOICE_PROCESSING_TIMEOUT_SECONDS:-300}"
+      DATABASE_PATH: "${DATABASE_PATH:-/app/data/ideas.db}"
+      DEFAULT_TIMEZONE: "${DEFAULT_TIMEZONE:-Europe/Moscow}"
+      DEFAULT_DIGEST_WEEKDAY: "${DEFAULT_DIGEST_WEEKDAY:-6}"
+      DEFAULT_DIGEST_TIME: "${DEFAULT_DIGEST_TIME:-19:00}"
+      SHORT_INPUT_CHAR_LIMIT: "${SHORT_INPUT_CHAR_LIMIT:-900}"
+    volumes:
+      - ideas_bot_data:/app/data
+    depends_on:
+      t-one:
+        condition: service_healthy
+
+  t-one:
+    image: tinkoffcreditsystems/t-one:0.1.0
+    restart: unless-stopped
+    expose:
+      - "8080"
+    ports:
+      - "127.0.0.1:8080:8080"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8080), 3); s.close()"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 120s
+
+volumes:
+  ideas_bot_data:
