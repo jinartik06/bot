@@ -1,0 +1,11 @@
+.env
+.venv/
+.docker-config/
+.git/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+models/
+models-smoke/
+tmp/

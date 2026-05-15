@@ -1,0 +1,40 @@
+services:
+  ideas-bot:
+    build: .
+    restart: unless-stopped
+    environment:
+      BOT_TOKEN: "${BOT_TOKEN:?BOT_TOKEN is required}"
+      GROQ_API_KEY: "${GROQ_API_KEY:-}"
+      GROQ_BASE_URL: "${GROQ_BASE_URL:-https://api.groq.com}"
+      ADMIN_TELEGRAM_IDS: "${ADMIN_TELEGRAM_IDS:-}"
+      ALLOWED_TELEGRAM_IDS: "${ALLOWED_TELEGRAM_IDS:-}"
+      ALLOW_ALL_USERS: "${ALLOW_ALL_USERS:-true}"
+      GROQ_TEXT_MODEL: "${GROQ_TEXT_MODEL:-qwen/qwen3-32b}"
+      GROQ_TRANSCRIBE_MODEL: "${GROQ_TRANSCRIBE_MODEL:-whisper-large-v3-turbo}"
+      VOICE_TRANSCRIBER: "${VOICE_TRANSCRIBER:-faster_whisper}"
+      WHISPER_MODEL: "${WHISPER_MODEL:-small}"
+      WHISPER_DEVICE: "${WHISPER_DEVICE:-cpu}"
+      WHISPER_COMPUTE_TYPE: "${WHISPER_COMPUTE_TYPE:-int8}"
+      WHISPER_CPU_THREADS: "${WHISPER_CPU_THREADS:-2}"
+      WHISPER_NUM_WORKERS: "${WHISPER_NUM_WORKERS:-1}"
+      WHISPER_LANGUAGE: "${WHISPER_LANGUAGE:-ru}"
+      WHISPER_BEAM_SIZE: "${WHISPER_BEAM_SIZE:-5}"
+      WHISPER_VAD_FILTER: "${WHISPER_VAD_FILTER:-false}"
+      WHISPER_MODEL_CACHE_DIR: "${WHISPER_MODEL_CACHE_DIR:-/app/models}"
+      VOICE_LOCK_WAIT_SECONDS: "${VOICE_LOCK_WAIT_SECONDS:-180}"
+      VOICE_LOCK_TTL_SECONDS: "${VOICE_LOCK_TTL_SECONDS:-600}"
+      FFMPEG_BINARY: "${FFMPEG_BINARY:-ffmpeg}"
+      MEDIA_COMMAND_TIMEOUT_SECONDS: "${MEDIA_COMMAND_TIMEOUT_SECONDS:-180}"
+      VOICE_PROCESSING_TIMEOUT_SECONDS: "${VOICE_PROCESSING_TIMEOUT_SECONDS:-300}"
+      DATABASE_PATH: "${DATABASE_PATH:-/app/data/ideas.db}"
+      DEFAULT_TIMEZONE: "${DEFAULT_TIMEZONE:-Europe/Moscow}"
+      DEFAULT_DIGEST_WEEKDAY: "${DEFAULT_DIGEST_WEEKDAY:-6}"
+      DEFAULT_DIGEST_TIME: "${DEFAULT_DIGEST_TIME:-19:00}"
+      SHORT_INPUT_CHAR_LIMIT: "${SHORT_INPUT_CHAR_LIMIT:-900}"
+    volumes:
+      - ideas_bot_data:/app/data
+      - whisper_models:/app/models
+
+volumes:
+  ideas_bot_data:
+  whisper_models:
