@@ -7,7 +7,7 @@ ENV RUNNING_IN_DOCKER=1
 WORKDIR /app
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libgomp1 tzdata \
+    && apt-get install -y --no-install-recommends ca-certificates ffmpeg libgomp1 tzdata tesseract-ocr tesseract-ocr-rus \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .

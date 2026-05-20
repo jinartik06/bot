@@ -1,6 +1,6 @@
 # Deploy В Dokploy
 
-Актуальная схема: один контейнер `ideas-bot`. Голосовые распознаются локально внутри контейнера через `faster-whisper`, текстовый анализ идёт через Groq.
+Актуальная схема: один контейнер `ideas-bot`. Голосовые распознаются локально через `faster-whisper`, фото сохраняются в `/app/data/photos`, OCR идёт через Tesseract, AI-разбор идёт через Groq.
 
 ## 1. Тип Приложения
 
@@ -46,6 +46,12 @@ FFMPEG_BINARY=ffmpeg
 MEDIA_COMMAND_TIMEOUT_SECONDS=180
 VOICE_PROCESSING_TIMEOUT_SECONDS=300
 
+PHOTO_STORAGE_DIR=/app/data/photos
+PHOTO_OCR_ENABLED=true
+TESSERACT_BINARY=tesseract
+PHOTO_OCR_LANGUAGE=rus+eng
+PHOTO_OCR_TIMEOUT_SECONDS=30
+
 DATABASE_PATH=/app/data/ideas.db
 DEFAULT_TIMEZONE=Europe/Moscow
 DEFAULT_DIGEST_WEEKDAY=6
@@ -63,7 +69,7 @@ volumes:
   whisper_models:
 ```
 
-`ideas_bot_data` хранит базу идей.  
+`ideas_bot_data` хранит базу идей и фото.  
 `whisper_models` хранит скачанную модель Whisper. Не удаляйте их при redeploy.
 
 ## 4. Первый Deploy
@@ -85,10 +91,12 @@ Ideas bot started
 В Telegram:
 
 1. `/start` - бот отвечает.
-2. Отправьте текст - бот сохраняет карточку.
+2. Отправьте длинный текст с несколькими идеями - бот сам создаёт несколько карточек.
 3. Отправьте голосовое 5-10 секунд - бот отвечает `Слушаю и разбираю идею...`, затем сохраняет карточку.
-4. Нажмите `Анализ` - Groq структурирует идею.
-5. `/admin` - у администратора открывается управление пользователями.
+4. Отправьте фото с подписью - бот сохраняет фото и создаёт карточку; если Tesseract видит текст на фото, он попадёт в подробности.
+5. Откройте `🖼 Альбом`, проверьте просмотр и удаление фото.
+6. Откройте `⚡ Следующие шаги`, `🔍 Поиск`, `📎 Архив`.
+7. `/admin` - у администратора открывается управление пользователями.
 
 ## 6. Логи
 
@@ -150,6 +158,18 @@ GROQ_TEXT_MODEL=qwen/qwen3-32b
 ```
 
 Groq audio не используется по умолчанию, потому что текущий проверенный ключ возвращал `401 Invalid API Key` на `/audio/transcriptions`, хотя текстовый `/responses` работал.
+
+OCR фото не работает
+
+Проверьте:
+
+```env
+PHOTO_OCR_ENABLED=true
+TESSERACT_BINARY=tesseract
+PHOTO_OCR_LANGUAGE=rus+eng
+```
+
+В Dockerfile уже устанавливается `tesseract-ocr` и `tesseract-ocr-rus`. Если OCR недоступен, бот всё равно сохраняет фото и работает по подписи.
 
 ## 8. Обновление
 
