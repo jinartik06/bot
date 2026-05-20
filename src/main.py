@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import aiohttp
+
 if __package__ in {None, ""}:
     import sys
 
@@ -23,15 +25,25 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, Message, TelegramObject
+from aiogram.types import BotCommand, CallbackQuery, Message, TelegramObject
 from aiogram.utils.markdown import hbold, hcode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from .ai import IdeaAI
 from .config import Config, load_config
 from .db import Database
-from .keyboards import admin_menu, categories_menu, idea_actions, main_menu, periods_menu, settings_menu
-from .render import compact_list, digest_text, idea_text, period_since, usage_help
+from .keyboards import (
+    album_photo_actions,
+    admin_menu,
+    archived_idea_actions,
+    categories_menu,
+    idea_actions,
+    main_menu,
+    periods_menu,
+    settings_menu,
+    start_menu,
+)
+from .render import album_caption, album_list_text, compact_list, digest_text, idea_details_text, idea_text, next_steps_text, period_since, start_text, usage_help
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -139,6 +151,9 @@ CATEGORY_LINE_RE = re.compile(
 TRAILING_CATEGORY_RE = re.compile(
     r"(?is)^(?P<body>.+?)\s+(?:category|категория|в категорию|добавь(?: это)? в категорию|отнеси(?: это)? в категорию)\s*[:\-–—]?\s*(?P<name>[^#\n\r]{2,80})\s*$",
 )
+URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def clean_category_name(value: str | None) -> str | None:
@@ -183,8 +198,159 @@ def category_name_from_chat_text(text: str | None) -> str | None:
     return clean_category_name(text)
 
 
+def first_url(text: str) -> str | None:
+    match = URL_RE.search(text)
+    return match.group(0).rstrip(".,);]") if match else None
+
+
+async def fetch_link_title(url: str) -> str | None:
+    timeout = aiohttp.ClientTimeout(total=8)
+    headers = {"User-Agent": "ideas-thoughts-bot/1.0"}
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as response:
+                if response.status >= 400:
+                    return None
+                content_type = response.headers.get("content-type", "")
+                if "html" not in content_type.lower():
+                    return None
+                raw = await response.content.read(200_000)
+                charset = response.charset or "utf-8"
+    except Exception:
+        logger.info("Could not fetch link title: %s", url, exc_info=True)
+        return None
+
+    page = raw.decode(charset, errors="ignore")
+    match = TITLE_RE.search(page)
+    if not match:
+        return None
+    title = html.unescape(re.sub(r"\s+", " ", match.group(1))).strip()
+    return title[:180] or None
+
+
+async def enrich_link_text(text: str) -> str:
+    url = first_url(text)
+    if not url:
+        return text
+    title = await fetch_link_title(url)
+    if not title:
+        return text
+    return f"{text.strip()}\n\nЗаголовок ссылки: {title}"
+
+
+def safe_photo_name(user_id: int, file_unique_id: str | None, suffix: str) -> Path:
+    clean_id = re.sub(r"[^A-Za-z0-9_-]+", "_", file_unique_id or "photo").strip("_") or "photo"
+    clean_suffix = suffix.lower() if suffix.lower() in PHOTO_EXTENSIONS else ".jpg"
+    return Path(str(user_id)) / f"{clean_id}{clean_suffix}"
+
+
+async def run_photo_ocr(path: Path, config: Config) -> str | None:
+    if not config.photo_ocr_enabled:
+        return None
+    args = [
+        config.tesseract_binary or "tesseract",
+        str(path),
+        "stdout",
+        "-l",
+        config.photo_ocr_language or "rus+eng",
+    ]
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(),
+            timeout=max(1, config.photo_ocr_timeout_seconds),
+        )
+    except FileNotFoundError:
+        logger.info("Photo OCR skipped: tesseract binary was not found")
+        return None
+    except asyncio.TimeoutError:
+        if "process" in locals() and process.returncode is None:
+            process.kill()
+            await process.wait()
+        logger.warning("Photo OCR timed out: path=%s", path)
+        return None
+
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="ignore")[-300:]
+        logger.info("Photo OCR skipped: tesseract failed with code=%s detail=%s", process.returncode, detail)
+        return None
+    text = " ".join(stdout.decode("utf-8", errors="ignore").split())
+    return text[:2000] or None
+
+
+async def save_photo_and_ocr(message: Message, bot: Bot, config: Config) -> tuple[str | None, str | None, str | None]:
+    if not message.photo:
+        return None, None, None
+
+    photo = message.photo[-1]
+    try:
+        tg_file = await bot.get_file(photo.file_id)
+        if not tg_file.file_path:
+            raise RuntimeError("Telegram returned an empty photo file path")
+        suffix = Path(tg_file.file_path).suffix or ".jpg"
+        relative_path = safe_photo_name(message.from_user.id, getattr(photo, "file_unique_id", None), suffix)
+        target_path = config.photo_storage_dir / relative_path
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        await bot.download_file(tg_file.file_path, destination=target_path)
+    except Exception:
+        logger.exception("Failed to save Telegram photo")
+        return photo.file_id, None, None
+
+    ocr_text = await run_photo_ocr(target_path, config)
+    return photo.file_id, str(target_path), ocr_text
+
+
+def merge_photo_text(caption: str, ocr_text: str | None) -> str:
+    caption = caption.strip()
+    if not ocr_text:
+        return caption or "Фото без подписи."
+    if caption:
+        return f"{caption}\n\nТекст с фото: {ocr_text}"
+    return f"Фото.\n\nТекст с фото: {ocr_text}"
+
+
+def delete_local_photo(photo_path: str | None, config: Config) -> bool:
+    if not photo_path:
+        return False
+    try:
+        target = Path(photo_path).resolve()
+        base = config.photo_storage_dir.resolve()
+        target.relative_to(base)
+    except (OSError, ValueError):
+        logger.warning("Refusing to delete photo outside storage dir: %s", photo_path)
+        return False
+
+    try:
+        if target.is_file():
+            target.unlink()
+            return True
+    except OSError:
+        logger.exception("Failed to delete local photo file: %s", target)
+    return False
+
+
 async def send_idea(message: Message, row) -> None:
     await send_chunks(message, idea_text(row), reply_markup=idea_actions(row["id"]))
+
+
+async def send_archived_idea(message: Message, row) -> None:
+    await send_chunks(message, idea_text(row), reply_markup=archived_idea_actions(row["id"]))
+
+
+async def send_album_photo(message: Message, row) -> None:
+    caption = album_caption(row)
+    markup = album_photo_actions(row["id"])
+    if row["photo_file_id"]:
+        try:
+            await message.answer_photo(row["photo_file_id"], caption=caption, reply_markup=markup)
+            return
+        except TelegramBadRequest as exc:
+            logger.warning("Could not send album photo, falling back to text: %s", exc)
+    await send_chunks(message, caption, reply_markup=markup)
 
 
 async def delete_status_message(message: Message | None) -> None:
@@ -330,12 +496,7 @@ def format_blocked_users(rows) -> str:
 async def start(message: Message, state: FSMContext, db: Database, config: Config) -> None:
     await register_seen_user(message, db, config)
     await state.clear()
-    user = await db.get_user(message.from_user.id)
-    await message.answer(
-        "Привет. Я буду ловить идеи на ходу: текст, голос, пересланные сообщения и фото с подписью.\n\n"
-        "Можно сразу присылать мысль. Анализ запускается отдельной кнопкой под карточкой.",
-        reply_markup=main_menu(user.is_admin if user else False),
-    )
+    await message.answer(start_text(), reply_markup=start_menu())
 
 
 @router.message(Form.waiting_name, F.text)
@@ -355,11 +516,11 @@ async def help_cmd(message: Message) -> None:
     await message.answer(usage_help())
 
 
-@router.message(Command("list"))
+@router.message(Command("list", "thoughts"))
 async def list_cmd(message: Message, db: Database) -> None:
-    rows = await db.list_ideas(message.from_user.id, 10)
+    rows = await db.list_ideas(message.from_user.id, 20)
     if not rows:
-        await message.answer("Идей пока нет.")
+        await message.answer("Пока мыслей нет.")
         return
     for row in rows:
         await send_idea(message, row)
@@ -372,7 +533,38 @@ async def search_cmd(message: Message, command: CommandObject, db: Database) -> 
         await message.answer(f"Напиши запрос: {hcode('/search упаковка')}")
         return
     rows = await db.search_ideas(message.from_user.id, query)
-    await message.answer(compact_list(rows))
+    if not rows:
+        await message.answer("Ничего не нашёл.")
+        return
+    for row in rows:
+        await send_idea(message, row)
+
+
+@router.message(Command("next", "steps"))
+async def next_cmd(message: Message, db: Database) -> None:
+    rows = await db.next_step_ideas(message.from_user.id)
+    await message.answer(next_steps_text(rows))
+
+
+@router.message(Command("archive"))
+async def archive_cmd(message: Message, db: Database) -> None:
+    rows = await db.archived_ideas(message.from_user.id)
+    if not rows:
+        await message.answer("Архив пуст.")
+        return
+    for row in rows:
+        await send_archived_idea(message, row)
+
+
+@router.message(Command("album"))
+async def album_cmd(message: Message, db: Database) -> None:
+    rows = await db.album_photos(message.from_user.id)
+    if not rows:
+        await message.answer("Альбом пока пуст.")
+        return
+    await message.answer(album_list_text(rows))
+    for row in rows:
+        await send_album_photo(message, row)
 
 
 @router.message(Command("today", "week", "month"))
@@ -417,13 +609,55 @@ async def nav_menu(callback: CallbackQuery, db: Database) -> None:
     await callback.answer()
 
 
+@router.callback_query(F.data == "nav:add")
+async def nav_add(callback: CallbackQuery) -> None:
+    await callback.message.answer("Просто отправь сюда текст, голосовое, фото, ссылку или пересланное сообщение. Я сам разберу это на карточки.")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "nav:how")
+async def nav_how(callback: CallbackQuery) -> None:
+    await callback.message.answer(usage_help())
+    await callback.answer()
+
+
 @router.callback_query(F.data == "nav:list")
 async def nav_list(callback: CallbackQuery, db: Database) -> None:
-    rows = await db.list_ideas(callback.from_user.id, 10)
+    rows = await db.list_ideas(callback.from_user.id, 20)
     if not rows:
-        await callback.message.answer("Идей пока нет.")
+        await callback.message.answer("Пока мыслей нет.")
     for row in rows:
         await send_idea(callback.message, row)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "nav:steps")
+async def nav_steps(callback: CallbackQuery, db: Database) -> None:
+    rows = await db.next_step_ideas(callback.from_user.id)
+    await callback.message.answer(next_steps_text(rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "nav:archive")
+async def nav_archive(callback: CallbackQuery, db: Database) -> None:
+    rows = await db.archived_ideas(callback.from_user.id)
+    if not rows:
+        await callback.message.answer("Архив пуст.")
+    for row in rows:
+        await send_archived_idea(callback.message, row)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "nav:album")
+async def nav_album(callback: CallbackQuery, db: Database) -> None:
+    rows = await db.album_photos(callback.from_user.id)
+    if not rows:
+        await callback.message.answer("Альбом пока пуст.")
+        await callback.answer()
+        return
+    await callback.message.answer(album_list_text(rows))
+    for row in rows:
+        await send_album_photo(callback.message, row)
     await callback.answer()
 
 
@@ -442,7 +676,11 @@ async def nav_search_text(message: Message, state: FSMContext, db: Database) -> 
         return
     rows = await db.search_ideas(message.from_user.id, query)
     await state.clear()
-    await message.answer(compact_list(rows))
+    if not rows:
+        await message.answer("Ничего не нашёл.")
+        return
+    for row in rows:
+        await send_idea(message, row)
 
 
 @router.callback_query(F.data == "nav:periods")
@@ -557,6 +795,55 @@ async def settings_timezone_text(message: Message, state: FSMContext, db: Databa
     await db.update_settings(message.from_user.id, timezone=value)
     await state.clear()
     await message.answer("Часовой пояс сохранён.")
+
+
+@router.callback_query(F.data.startswith("idea:details:"))
+async def show_details(callback: CallbackQuery, db: Database) -> None:
+    idea_id = int(callback.data.split(":")[2])
+    row = await db.get_idea(callback.from_user.id, idea_id)
+    if row:
+        await send_chunks(callback.message, idea_details_text(row))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("idea:archive:"))
+async def archive_idea(callback: CallbackQuery, db: Database) -> None:
+    idea_id = int(callback.data.split(":")[2])
+    await db.archive_idea(callback.from_user.id, idea_id)
+    await callback.message.edit_text("Запись убрана в архив.")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("idea:restore:"))
+async def restore_idea(callback: CallbackQuery, db: Database) -> None:
+    idea_id = int(callback.data.split(":")[2])
+    await db.restore_idea(callback.from_user.id, idea_id)
+    row = await db.get_idea(callback.from_user.id, idea_id)
+    if row:
+        await callback.message.edit_text(idea_text(row), reply_markup=idea_actions(row["id"]))
+    await callback.answer("Вернул в мысли")
+
+
+@router.callback_query(F.data.startswith("photo:delete:"))
+async def delete_photo(callback: CallbackQuery, db: Database, config: Config) -> None:
+    idea_id = int(callback.data.split(":")[2])
+    row = await db.remove_idea_photo(callback.from_user.id, idea_id)
+    if not row:
+        await callback.answer("Фото уже удалено", show_alert=True)
+        return
+    deleted_file = delete_local_photo(row["photo_path"], config)
+    text = "Фото удалено из альбома."
+    if deleted_file:
+        text += " Локальный файл тоже удалён."
+    if callback.message:
+        try:
+            if callback.message.photo:
+                await callback.message.edit_caption(text)
+            else:
+                await callback.message.edit_text(text)
+        except TelegramBadRequest:
+            await callback.message.answer(text)
+    await callback.answer("Удалено")
 
 
 @router.callback_query(F.data.startswith("idea:original:"))
@@ -836,20 +1123,26 @@ async def capture_idea(message: Message, state: FSMContext, bot: Bot, db: Databa
 
     source_type = "text"
     photo_file_id = None
+    photo_path = None
+    photo_ocr_text = None
     raw_text = (message.text or message.caption or "").strip()
     category_hint: str | None = None
 
     if message.photo:
         source_type = "photo"
-        photo_file_id = message.photo[-1].file_id
-        if not raw_text:
-            await message.answer("Фото принято, но нужна подпись с текстом идеи.")
-            return
+        status_message = await message.answer("Сохраняю фото и разбираю подпись...")
+        photo_file_id, photo_path, photo_ocr_text = await save_photo_and_ocr(message, bot, config)
+        raw_text = merge_photo_text(raw_text, photo_ocr_text)
+        await delete_status_message(status_message)
 
     if message.voice or message.audio:
         source_type = "voice" if message.voice else "audio"
         if not ai.can_transcribe():
-            await message.answer("Голосовые сейчас не настроены. Проверь VOICE_TRANSCRIBER=faster_whisper или GROQ_API_KEY для VOICE_TRANSCRIBER=groq.")
+            detail = ai.local_whisper_runtime_issue() if ai.uses_local_whisper_transcriber() else None
+            if detail:
+                await message.answer(f"Голосовые сейчас не готовы: {detail}.")
+            else:
+                await message.answer("Голосовые сейчас не настроены. Проверь VOICE_TRANSCRIBER=faster_whisper.")
             return
         media = message.voice or message.audio
         logger.info(
@@ -934,13 +1227,46 @@ async def capture_idea(message: Message, state: FSMContext, bot: Bot, db: Databa
         return
 
     if not raw_text:
-        await message.answer("Не вижу текста идеи. Пришли текст, голосовое или фото с подписью.")
+        await message.answer("Не вижу текста идеи. Пришли текст, голосовое, ссылку или фото.")
         return
 
-    payload = ai.raw_idea_payload(raw_text, category_hint)
-    idea_id = await db.create_idea(message.from_user.id, payload, raw_text, source_type, photo_file_id)
-    row = await db.get_idea(message.from_user.id, idea_id)
-    await send_idea(message, row)
+    if first_url(raw_text):
+        if source_type == "text":
+            source_type = "link"
+        raw_text = await enrich_link_text(raw_text)
+
+    analysis_status = await message.answer("Разбираю на карточки...")
+    try:
+        payloads = await ai.structure_entries(raw_text, source_type, bool(photo_file_id))
+    except Exception:
+        logger.exception("Idea structuring failed")
+        payloads = [ai.raw_idea_payload(raw_text, category_hint)]
+
+    if category_hint:
+        for payload in payloads:
+            payload["category"] = category_hint
+
+    rows = []
+    for payload in payloads:
+        original_text = str(payload.get("original_text") or raw_text).strip() or raw_text
+        idea_id = await db.create_idea(
+            message.from_user.id,
+            payload,
+            original_text,
+            source_type,
+            photo_file_id,
+            photo_path,
+            photo_ocr_text,
+        )
+        row = await db.get_idea(message.from_user.id, idea_id)
+        if row:
+            rows.append(row)
+
+    await delete_status_message(analysis_status)
+    if len(rows) > 1:
+        await message.answer(f"Разобрал на {len(rows)} карточки.")
+    for row in rows:
+        await send_idea(message, row)
 
 
 async def send_due_digests(bot: Bot, db: Database) -> None:
@@ -998,6 +1324,18 @@ async def main() -> None:
 
     logger.info("Ideas bot started")
     try:
+        await bot.set_my_commands(
+            [
+                BotCommand(command="start", description="Первый экран"),
+                BotCommand(command="list", description="Мысли"),
+                BotCommand(command="next", description="Следующие шаги"),
+                BotCommand(command="search", description="Поиск"),
+                BotCommand(command="album", description="Альбом фото"),
+                BotCommand(command="archive", description="Архив"),
+                BotCommand(command="help", description="Как это работает"),
+                BotCommand(command="settings", description="Настройки"),
+            ]
+        )
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:

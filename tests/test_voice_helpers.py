@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -36,7 +37,7 @@ class VoiceHelperTests(unittest.TestCase):
         ai = IdeaAI(make_config())
 
         self.assertTrue(ai.uses_local_whisper_transcriber())
-        self.assertTrue(ai.can_transcribe())
+        self.assertEqual(ai.can_transcribe(), ai.local_whisper_runtime_issue() is None)
 
     def test_groq_voice_transcriber_requires_key(self) -> None:
         without_key = IdeaAI(make_config(voice_transcriber="groq"))
@@ -50,6 +51,13 @@ class VoiceHelperTests(unittest.TestCase):
         ai = IdeaAI(make_config(voice_transcriber="unknown"))
 
         self.assertFalse(ai.can_transcribe())
+
+    def test_local_whisper_runtime_issue_blocks_native_load(self) -> None:
+        ai = IdeaAI(make_config())
+
+        with patch.object(ai, "local_whisper_runtime_issue", return_value="unsupported runtime"):
+            with self.assertRaisesRegex(RuntimeError, "unsupported runtime"):
+                asyncio.run(ai.transcribe(Path("voice.ogg")))
 
     def test_clean_transcript_removes_filler_words(self) -> None:
         ai = IdeaAI(make_config())
@@ -95,8 +103,27 @@ class VoiceAudioPreparationTests(unittest.IsolatedAsyncioTestCase):
     async def test_local_whisper_failure_does_not_fall_back_to_groq(self) -> None:
         ai = IdeaAI(make_config(groq_api_key="test-key", voice_transcriber="faster_whisper"))
 
-        with patch.object(ai, "_transcribe_faster_whisper", new=AsyncMock(side_effect=RuntimeError("whisper down"))):
+        with (
+            patch.object(ai, "local_whisper_runtime_issue", return_value=None),
+            patch.object(ai, "_transcribe_faster_whisper", new=AsyncMock(side_effect=RuntimeError("whisper down"))),
+        ):
             with self.assertRaisesRegex(RuntimeError, "whisper down"):
+                await ai.transcribe(Path("voice.ogg"))
+
+    async def test_groq_voice_transcriber_uses_separate_service(self) -> None:
+        ai = IdeaAI(make_config(groq_api_key="test-key", voice_transcriber="groq"))
+
+        with patch.object(ai._groq_voice, "transcribe", new=AsyncMock(return_value="эээ ну тестовая расшифровка")) as transcribe:
+            result = await ai.transcribe(Path("voice.ogg"))
+
+        transcribe.assert_awaited_once_with(Path("voice.ogg"))
+        self.assertEqual(result, "тестовая расшифровка")
+
+    async def test_groq_voice_empty_response_is_reported(self) -> None:
+        ai = IdeaAI(make_config(groq_api_key="test-key", voice_transcriber="groq"))
+
+        with patch.object(ai._groq_voice, "transcribe", new=AsyncMock(return_value="")):
+            with self.assertRaisesRegex(RuntimeError, "empty transcript"):
                 await ai.transcribe(Path("voice.ogg"))
 
 

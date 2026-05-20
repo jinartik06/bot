@@ -3,18 +3,33 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
+def start_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="➕ Добавить мысль", callback_data="nav:add"),
+                InlineKeyboardButton(text="💭 Мысли", callback_data="nav:list"),
+            ],
+            [InlineKeyboardButton(text="❓ Как это работает", callback_data="nav:how")],
+        ]
+    )
+
+
 def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
-            InlineKeyboardButton(text="Последние идеи", callback_data="nav:list"),
-            InlineKeyboardButton(text="Поиск", callback_data="nav:search"),
+            InlineKeyboardButton(text="💭 Мысли", callback_data="nav:list"),
+            InlineKeyboardButton(text="⚡ Следующие шаги", callback_data="nav:steps"),
         ],
         [
-            InlineKeyboardButton(text="Категории", callback_data="nav:categories"),
-            InlineKeyboardButton(text="Периоды", callback_data="nav:periods"),
+            InlineKeyboardButton(text="🔍 Поиск", callback_data="nav:search"),
+            InlineKeyboardButton(text="📎 Архив", callback_data="nav:archive"),
         ],
         [
-            InlineKeyboardButton(text="Настройки", callback_data="nav:settings"),
+            InlineKeyboardButton(text="🖼 Альбом", callback_data="nav:album"),
+        ],
+        [
+            InlineKeyboardButton(text="⚙ Настройки", callback_data="nav:settings"),
         ],
     ]
     if is_admin:
@@ -26,16 +41,30 @@ def idea_actions(idea_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Анализ", callback_data=f"idea:analyze:{idea_id}"),
-                InlineKeyboardButton(text="Категория", callback_data=f"idea:category:{idea_id}"),
+                InlineKeyboardButton(text="Подробнее", callback_data=f"idea:details:{idea_id}"),
+                InlineKeyboardButton(text="Архивировать", callback_data=f"idea:archive:{idea_id}"),
             ],
+        ]
+    )
+
+
+def archived_idea_actions(idea_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                InlineKeyboardButton(text="Оригинал", callback_data=f"idea:original:{idea_id}"),
-                InlineKeyboardButton(text="Закрепить", callback_data=f"idea:pin:{idea_id}"),
+                InlineKeyboardButton(text="Подробнее", callback_data=f"idea:details:{idea_id}"),
+                InlineKeyboardButton(text="Вернуть", callback_data=f"idea:restore:{idea_id}"),
             ],
+        ]
+    )
+
+
+def album_photo_actions(idea_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
             [
-                InlineKeyboardButton(text="Заголовок", callback_data=f"idea:rename:{idea_id}"),
-                InlineKeyboardButton(text="Удалить", callback_data=f"idea:delete:{idea_id}"),
+                InlineKeyboardButton(text="Подробнее", callback_data=f"idea:details:{idea_id}"),
+                InlineKeyboardButton(text="Удалить фото", callback_data=f"photo:delete:{idea_id}"),
             ],
         ]
     )

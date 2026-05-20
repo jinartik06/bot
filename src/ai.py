@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import mimetypes
+import os
 import re
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from typing import Any
 import aiohttp
 
 from .config import Config
+from .groq_voice import GroqVoiceTranscriber
 
 
 logger = logging.getLogger("ideas_bot.ai")
@@ -48,12 +50,36 @@ class IdeaAI:
         "эм",
         "эмм",
         "эммм",
-     }
+    }
+    ENTRY_TYPES = {
+        "Идея",
+        "Задача",
+        "Напоминание",
+        "Контент",
+        "Покупка",
+        "Мысль",
+        "Инсайт",
+        "Ссылка",
+        "Наблюдение",
+    }
+    DEFAULT_CATEGORIES = {
+        "Работа",
+        "Бизнес",
+        "Контент",
+        "Личное",
+        "Здоровье",
+        "Финансы",
+        "Обучение",
+        "Покупки",
+        "Идеи",
+        "Без категории",
+    }
 
     def __init__(self, config: Config):
         self.config = config
         self._voice_lock = asyncio.Lock()
         self._whisper_model: Any | None = None
+        self._groq_voice = GroqVoiceTranscriber(config)
 
     def has_api(self) -> bool:
         return bool(self.config.groq_api_key)
@@ -64,9 +90,14 @@ class IdeaAI:
     def uses_local_whisper_transcriber(self) -> bool:
         return self.config.voice_transcriber in {"faster_whisper", "local_whisper", "whisper"}
 
+    def local_whisper_runtime_issue(self) -> str | None:
+        if os.name == "nt" and sys.version_info >= (3, 14):
+            return "Python 3.14 on Windows is not supported by faster-whisper native runtime; use Python 3.12 or Docker"
+        return None
+
     def can_transcribe(self) -> bool:
         if self.uses_local_whisper_transcriber():
-            return True
+            return self.local_whisper_runtime_issue() is None
         if self.uses_groq_transcriber():
             return bool(self.config.groq_api_key)
         return False
@@ -76,50 +107,31 @@ class IdeaAI:
 
     async def check_voice_transcriber(self) -> tuple[bool, str]:
         if self.uses_local_whisper_transcriber():
+            runtime_issue = self.local_whisper_runtime_issue()
+            if runtime_issue:
+                return False, runtime_issue
             try:
                 import faster_whisper  # noqa: F401
             except ImportError:
                 return False, "faster-whisper is not installed"
             return True, f"faster-whisper model={self.config.whisper_model} will load on first voice"
         if self.uses_groq_transcriber():
-            if not self.config.groq_api_key:
-                return False, "GROQ_API_KEY is required for Groq voice transcription"
-            return True, f"Groq audio model={self.config.groq_transcribe_model}"
+            return await self._groq_voice.check_startup()
         return False, f"Unsupported VOICE_TRANSCRIBER={self.config.voice_transcriber}"
 
     async def transcribe(self, path: Path) -> str:
         if self.uses_local_whisper_transcriber():
+            runtime_issue = self.local_whisper_runtime_issue()
+            if runtime_issue:
+                raise RuntimeError(runtime_issue)
             async with self._voice_lock:
                 return await self._transcribe_faster_whisper(path)
         if self.uses_groq_transcriber():
-            if not self.config.groq_api_key:
-                raise RuntimeError("GROQ_API_KEY is required for Groq voice transcription")
             return await self._transcribe_groq_audio(path)
         raise RuntimeError(f"Unsupported VOICE_TRANSCRIBER: {self.config.voice_transcriber}")
 
     async def _transcribe_groq_audio(self, path: Path) -> str:
-        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
-        form = aiohttp.FormData()
-        form.add_field("model", self.config.groq_transcribe_model)
-        if self.config.whisper_language:
-            form.add_field("language", self.config.whisper_language)
-        form.add_field("response_format", "json")
-        form.add_field("file", path.read_bytes(), filename=path.name, content_type=mime_type)
-
-        headers = {"Authorization": f"Bearer {self.config.groq_api_key}"}
-        url = f"{self.config.groq_base_url.rstrip('/')}/openai/v1/audio/transcriptions"
-        timeout = aiohttp.ClientTimeout(total=self.config.voice_processing_timeout_seconds)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, headers=headers, data=form) as response:
-                text = await response.text()
-                if response.status >= 400:
-                    raise RuntimeError(f"Groq audio transcription failed with HTTP {response.status}: {text[:500]}")
-                try:
-                    data = json.loads(text)
-                except json.JSONDecodeError as exc:
-                    raise RuntimeError("Groq audio transcription returned non-JSON response") from exc
-
-        transcript = self.clean_transcript(str(data.get("text") or ""))
+        transcript = self.clean_transcript(await self._groq_voice.transcribe(path))
         if not transcript:
             raise EmptyTranscriptError("Groq audio transcription returned an empty transcript")
         return transcript
@@ -306,17 +318,63 @@ class IdeaAI:
         first_line = next((line.strip() for line in clean.splitlines() if line.strip()), clean[:80])
         title = first_line[:80] or "Новая мысль"
         return {
+            "type": self._infer_type(clean, "text"),
             "title": title,
             "summary": None,
             "tldr": None,
             "full_text": None,
             "key_points": [],
+            "tasks": [],
             "open_questions": [],
             "next_step": None,
             "side_thoughts": None,
             "category": category or "Без категории",
             "tags": [],
+            "original_text": clean,
         }
+
+    async def structure_entries(
+        self,
+        raw_text: str,
+        source_type: str,
+        has_photo: bool,
+        *,
+        allow_fallback: bool = True,
+    ) -> list[dict[str, Any]]:
+        clean = raw_text.strip()
+        if not clean:
+            return []
+        if not self.has_api():
+            if not allow_fallback:
+                raise RuntimeError("GROQ_API_KEY is not configured")
+            return self._fallback_entries(clean, source_type)
+
+        size = "short" if len(clean) <= self.config.short_input_char_limit else "long"
+        prompt = self._entries_prompt(clean, source_type, has_photo, size)
+        try:
+            content = await self._create_text_response(prompt)
+        except Exception:
+            logger.exception("Groq text structuring failed, using fallback cards")
+            if not allow_fallback:
+                raise
+            return self._fallback_entries(clean, source_type)
+
+        data = self._parse_json_response(content)
+        if data is None:
+            logger.warning("Groq returned non-JSON response, using fallback cards")
+            if not allow_fallback:
+                raise RuntimeError("Groq returned non-JSON response")
+            return self._fallback_entries(clean, source_type)
+
+        cards = data.get("cards") or data.get("entries") or data.get("items")
+        if not isinstance(cards, list):
+            cards = [data]
+        normalized = [
+            self._normalize(card, clean)
+            for card in cards[:12]
+            if isinstance(card, dict)
+        ]
+        return normalized or self._fallback_entries(clean, source_type)
 
     async def structure_idea(
         self,
@@ -351,7 +409,7 @@ class IdeaAI:
 
     async def _create_text_response(self, prompt: str) -> str:
         system_prompt = (
-            "You are an editor for a personal idea archive. "
+            "You are an editor for a simple personal place for thoughts, tasks, ideas and links. "
             "Preserve the user's meaning and important details. "
             "Write user-facing values in Russian. Return only one valid JSON object."
         )
@@ -395,15 +453,65 @@ class IdeaAI:
             return "\n".join(parts).strip()
         raise RuntimeError("Groq Responses API returned no output text")
 
+    def _entries_prompt(self, text: str, source_type: str, has_photo: bool, size: str) -> str:
+        split_rule = (
+            "If the message contains several independent thoughts, tasks, purchases, links or content ideas, "
+            "split them into separate cards. If it is one coherent thought, return one card."
+        )
+        if size == "long":
+            split_rule += " Prefer 3-10 cards for long chaotic notes, but do not split one idea just to fill a quota."
+
+        return f"""
+Source: {source_type}
+Photo as context: {"yes" if has_photo else "no"}
+
+Product behavior:
+The bot is a simple place for thoughts. The user should not sort anything manually.
+
+Task:
+1. Clean filler sounds and filler words, but preserve meaning and useful details.
+2. {split_rule}
+3. For each card choose one type from: Идея, Задача, Напоминание, Контент, Покупка, Мысль, Инсайт, Ссылка, Наблюдение.
+4. Choose a short category. Prefer: Работа, Бизнес, Контент, Личное, Здоровье, Финансы, Обучение, Покупки, Идеи.
+5. Extract concrete tasks/action items into tasks.
+6. Put the clearest next action into next_step. If there is no action, use null.
+7. Keep each summary to 1-3 short sentences.
+8. Return exactly one JSON object:
+{{
+  "cards": [
+    {{
+      "type": "Идея",
+      "title": "short clear title in Russian",
+      "summary": "1-3 short sentences in Russian",
+      "full_text": "cleaned relevant full text for this card",
+      "key_points": ["important details"],
+      "tasks": ["task/action item"],
+      "open_questions": ["uncertainty or question"],
+      "next_step": "next action or null",
+      "side_thoughts": "short side thought or null",
+      "category": "short category",
+      "tags": ["3-5 tags without #"],
+      "original_text": "the exact relevant part of the user's message"
+    }}
+  ]
+}}
+Do not add markdown, code fences, explanations, or text around JSON.
+
+Original text:
+{text}
+"""
+
     def _prompt(self, text: str, source_type: str, has_photo: bool, size: str) -> str:
         if size == "short":
             shape = """
 For a short idea fill:
+- type: one of Идея, Задача, Напоминание, Контент, Покупка, Мысль, Инсайт, Ссылка, Наблюдение
 - title: one line, in Russian
 - summary: 2-3 sentences, in Russian
 - tldr: null
 - full_text: null
 - key_points: []
+- tasks: task/action items as a list in Russian
 - open_questions: []
 - next_step: action item in Russian, or null
 - side_thoughts: side thoughts in Russian, or null
@@ -413,11 +521,13 @@ For a short idea fill:
         else:
             shape = """
 For a long detailed idea fill:
+- type: one of Идея, Задача, Напоминание, Контент, Покупка, Мысль, Инсайт, Ссылка, Наблюдение
 - title: one line, in Russian
 - summary: null
 - tldr: 2-3 sentences in Russian
 - full_text: structured full transcript in Russian with headings and lists, do not drop important details
 - key_points: key points as a list in Russian
+- tasks: task/action items as a list in Russian
 - open_questions: doubts, uncertainties, "need to think", questions, in Russian
 - next_step: next step/action item in Russian, or null
 - side_thoughts: separate side-thoughts block in Russian if present, otherwise null
@@ -432,9 +542,9 @@ Task:
 1. Remove filler sounds, hesitation noises and filler words such as "эээ", "ммм", "эм", "ну", "типа", "как бы", "короче"; preserve vivid meaningful phrasing.
 2. Do not invent facts.
 3. If the user was unsure, put that into open_questions.
-4. If there is an action item, put it into next_step.
+4. If there are action items, put them into tasks and put the clearest one into next_step.
 5. Return exactly these JSON keys:
-title, summary, tldr, full_text, key_points, open_questions, next_step, side_thoughts, category, tags.
+type, title, summary, tldr, full_text, key_points, tasks, open_questions, next_step, side_thoughts, category, tags.
 Do not add markdown, code fences, explanations, or text around JSON.
 
 {shape}
@@ -465,30 +575,156 @@ Original text:
     def _fallback(self, text: str) -> dict[str, Any]:
         first_line = next((line.strip() for line in text.splitlines() if line.strip()), text[:80])
         title = first_line[:80] or "Новая идея"
+        entry_type = self._infer_type(text, "text")
+        tasks = self._infer_tasks(text)
         return {
+            "type": entry_type,
             "title": title,
-            "summary": text[:700],
+            "summary": self._short_summary(text),
             "tldr": None,
-            "full_text": None,
+            "full_text": text if len(text) > 260 else None,
             "key_points": [],
+            "tasks": tasks,
             "open_questions": [],
-            "next_step": None,
+            "next_step": tasks[0] if tasks else None,
             "side_thoughts": None,
-            "category": "Без категории",
-            "tags": ["идея", "входящее", "без-разбора"],
+            "category": self._infer_category(text, entry_type),
+            "tags": self._fallback_tags(text, entry_type),
+            "original_text": text,
         }
+
+    def _fallback_entries(self, text: str, source_type: str) -> list[dict[str, Any]]:
+        parts = self._split_into_card_parts(text)
+        return [self._normalize(self._fallback(part), part) for part in parts[:12]]
 
     def _normalize(self, data: dict[str, Any], text: str) -> dict[str, Any]:
         fallback = self._fallback(text)
         for key, value in fallback.items():
             data.setdefault(key, value)
-        for key in ("key_points", "open_questions", "tags"):
+        entry_type = str(data.get("type") or data.get("entry_type") or fallback["type"]).strip()
+        data["type"] = entry_type if entry_type in self.ENTRY_TYPES else fallback["type"]
+        for key in ("key_points", "tasks", "open_questions", "tags"):
             value = data.get(key)
             if isinstance(value, str):
                 data[key] = [value]
             elif not isinstance(value, list):
                 data[key] = []
+            data[key] = [str(item).strip() for item in data[key] if str(item).strip()][:8]
+        data["title"] = str(data.get("title") or fallback["title"]).strip()[:180] or fallback["title"]
+        data["summary"] = self._nullable_text(data.get("summary"), 600) or fallback["summary"]
+        data["tldr"] = self._nullable_text(data.get("tldr"), 700)
+        data["full_text"] = self._nullable_text(data.get("full_text"), 4000)
+        data["next_step"] = self._nullable_text(data.get("next_step"), 240)
+        data["side_thoughts"] = self._nullable_text(data.get("side_thoughts"), 500)
+        data["category"] = self._nullable_text(data.get("category"), 80) or fallback["category"]
+        data["original_text"] = self._nullable_text(data.get("original_text"), 4000) or text
         data["tags"] = [str(tag).strip().lstrip("#")[:40] for tag in data["tags"] if str(tag).strip()][:5]
         if not data["tags"]:
             data["tags"] = fallback["tags"]
         return data
+
+    def _nullable_text(self, value: Any, limit: int) -> str | None:
+        if value is None:
+            return None
+        clean = " ".join(str(value).split())
+        if not clean or clean.lower() == "null":
+            return None
+        return clean[:limit]
+
+    def _short_summary(self, text: str) -> str:
+        clean = " ".join(text.split())
+        if len(clean) <= 260:
+            return clean
+        sentences = re.split(r"(?<=[.!?])\s+", clean)
+        summary = ""
+        for sentence in sentences:
+            candidate = f"{summary} {sentence}".strip()
+            if len(candidate) > 320:
+                break
+            summary = candidate
+        return summary or clean[:260].rstrip(" ,.;:") + "..."
+
+    def _split_into_card_parts(self, text: str) -> list[str]:
+        clean = text.strip()
+        bullet_matches = re.findall(r"(?m)^\s*(?:[-*•]|\d+[.)])\s+(.+)$", clean)
+        if len(bullet_matches) >= 2 and len(clean) > 80:
+            return [part.strip() for part in bullet_matches if len(part.strip()) > 8]
+
+        paragraphs = [part.strip() for part in re.split(r"\n{2,}", clean) if part.strip()]
+        if len(paragraphs) >= 2 and len(clean) > 600:
+            return paragraphs
+
+        if len(clean) <= 1800:
+            return [clean]
+
+        sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", clean) if part.strip()]
+        chunks: list[str] = []
+        current = ""
+        for sentence in sentences:
+            candidate = f"{current} {sentence}".strip()
+            if current and len(candidate) > 1200:
+                chunks.append(current)
+                current = sentence
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks or [clean]
+
+    def _infer_type(self, text: str, source_type: str) -> str:
+        lower = text.lower()
+        if source_type == "link" or re.search(r"https?://", lower):
+            return "Ссылка"
+        if re.search(r"\b(надо|нужно|сделать|проверить|написать|позвонить|запустить|подготовить)\b", lower):
+            return "Задача"
+        if re.search(r"\b(напомни|напоминание|не забыть|дедлайн)\b", lower):
+            return "Напоминание"
+        if re.search(r"\b(купить|заказать|покупка|цена|стоимость)\b", lower):
+            return "Покупка"
+        if re.search(r"\b(пост|ролик|сторис|контент|сценарий|видео)\b", lower):
+            return "Контент"
+        if re.search(r"\b(инсайт|понял|осознал|вывод)\b", lower):
+            return "Инсайт"
+        if re.search(r"\b(идея|можно сделать|придумал)\b", lower):
+            return "Идея"
+        if re.search(r"\b(заметил|наблюдение|вижу)\b", lower):
+            return "Наблюдение"
+        return "Мысль"
+
+    def _infer_category(self, text: str, entry_type: str) -> str:
+        lower = text.lower()
+        if entry_type == "Покупка":
+            return "Покупки"
+        if re.search(r"\b(работа|клиент|проект|созвон)\b", lower):
+            return "Работа"
+        if re.search(r"\b(бизнес|продажи|деньги|выручка|маркетинг)\b", lower):
+            return "Бизнес"
+        if re.search(r"\b(пост|ролик|контент|канал|сторис)\b", lower):
+            return "Контент"
+        if re.search(r"\b(здоровье|спорт|сон|врач)\b", lower):
+            return "Здоровье"
+        if re.search(r"\b(финансы|счет|налог|бюджет)\b", lower):
+            return "Финансы"
+        if re.search(r"\b(курс|учеба|книга|обучение)\b", lower):
+            return "Обучение"
+        if entry_type == "Идея":
+            return "Идеи"
+        return "Личное"
+
+    def _infer_tasks(self, text: str) -> list[str]:
+        tasks: list[str] = []
+        for line in re.split(r"[\n.;!?]+", text):
+            clean = " ".join(line.split())
+            if not clean:
+                continue
+            lower = clean.lower()
+            if re.search(r"\b(надо|нужно|сделать|проверить|написать|позвонить|запустить|подготовить|купить|заказать)\b", lower):
+                tasks.append(clean[:220])
+        return tasks[:5]
+
+    def _fallback_tags(self, text: str, entry_type: str) -> list[str]:
+        tags = ["мысли", entry_type.lower()]
+        category = self._infer_category(text, entry_type).lower()
+        if category not in tags:
+            tags.append(category)
+        return tags[:5]

@@ -64,6 +64,11 @@ class Config:
     ffmpeg_binary: str = "ffmpeg"
     media_command_timeout_seconds: int = 180
     voice_processing_timeout_seconds: int = 300
+    photo_storage_dir: Path = Path("data/photos")
+    photo_ocr_enabled: bool = True
+    tesseract_binary: str = "tesseract"
+    photo_ocr_language: str = "rus+eng"
+    photo_ocr_timeout_seconds: int = 30
 
 
 def load_config() -> Config:
@@ -107,4 +112,9 @@ def load_config() -> Config:
         ffmpeg_binary=(os.getenv("FFMPEG_BINARY", "ffmpeg") or "ffmpeg").strip(),
         media_command_timeout_seconds=int(os.getenv("MEDIA_COMMAND_TIMEOUT_SECONDS", "180")),
         voice_processing_timeout_seconds=int(os.getenv("VOICE_PROCESSING_TIMEOUT_SECONDS", "300")),
+        photo_storage_dir=Path(os.getenv("PHOTO_STORAGE_DIR", "data/photos")),
+        photo_ocr_enabled=_bool(os.getenv("PHOTO_OCR_ENABLED"), True),
+        tesseract_binary=(os.getenv("TESSERACT_BINARY", "tesseract") or "tesseract").strip(),
+        photo_ocr_language=(os.getenv("PHOTO_OCR_LANGUAGE", "rus+eng") or "rus+eng").strip(),
+        photo_ocr_timeout_seconds=int(os.getenv("PHOTO_OCR_TIMEOUT_SECONDS", "30")),
     )

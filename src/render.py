@@ -10,49 +10,81 @@ from aiogram.utils.markdown import hbold, hcode, hitalic
 from .db import loads
 
 
+TYPE_EMOJI = {
+    "Идея": "💡",
+    "Задача": "✅",
+    "Напоминание": "⏰",
+    "Контент": "📝",
+    "Покупка": "🛒",
+    "Мысль": "🧠",
+    "Инсайт": "✨",
+    "Ссылка": "🔗",
+    "Наблюдение": "👁",
+}
+
+
+def entry_type(row) -> str:
+    return row["entry_type"] or "Мысль"
+
+
+def entry_type_line(row) -> str:
+    item_type = entry_type(row)
+    return f"{TYPE_EMOJI.get(item_type, '🧠')} {hbold(item_type)}"
+
+
+def summary_for_card(row) -> str:
+    text = row["summary"] or row["tldr"] or row["full_text"] or row["original_text"] or ""
+    text = " ".join(str(text).split())
+    if len(text) <= 320:
+        return text
+    return text[:317].rstrip(" ,.;:") + "..."
+
+
 def idea_text(row) -> str:
-    tags = ", ".join(f"#{tag}" for tag in loads(row["tags_json"]))
-    has_analysis = any(
-        [
-            row["summary"],
-            row["tldr"],
-            row["full_text"],
-            loads(row["key_points_json"]),
-            loads(row["open_questions_json"]),
-            row["next_step"],
-            row["side_thoughts"],
-            tags,
-        ]
-    )
     lines = [
-        f"{hbold(row['title'])}",
-        f"Категория: {quote_html(row['category'] or 'Без категории')}",
+        entry_type_line(row),
+        hbold(row["title"]),
     ]
-    if row["pinned_at"]:
-        lines.append("Закреплено в чате")
-    lines.extend(["", f"{hbold('Мысль')}", quote_html(row["original_text"])])
-    if has_analysis:
-        lines.extend(["", hbold("Анализ")])
-    if row["summary"]:
-        lines.append(quote_html(row["summary"]))
-    if row["tldr"]:
-        lines.extend(["", f"{hbold('TL;DR')}: {quote_html(row['tldr'])}"])
-    if row["full_text"]:
-        lines.extend(["", quote_html(row["full_text"])])
+    summary = summary_for_card(row)
+    if summary:
+        lines.extend(["", f"{hbold('Summary')}: {quote_html(summary)}"])
+    if row["next_step"]:
+        lines.extend(["", f"{hbold('Следующий шаг')}: {quote_html(row['next_step'])}"])
+    return "\n".join(lines)
+
+
+def idea_details_text(row) -> str:
+    tags = ", ".join(f"#{tag}" for tag in loads(row["tags_json"]))
+    tasks = loads(row["tasks_json"])
     key_points = loads(row["key_points_json"])
+    questions = loads(row["open_questions_json"])
+
+    lines = [
+        entry_type_line(row),
+        hbold(row["title"]),
+        "",
+        hbold("Полный текст"),
+        quote_html(row["full_text"] or row["original_text"]),
+    ]
+    if row["summary"] or row["tldr"]:
+        lines.extend(["", f"{hbold('Summary')}: {quote_html(row['summary'] or row['tldr'])}"])
+    if "photo_ocr_text" in row.keys() and row["photo_ocr_text"]:
+        lines.extend(["", hbold("Текст с фото"), quote_html(row["photo_ocr_text"])])
+    if tasks:
+        lines.append("")
+        lines.append(hbold("Задачи"))
+        lines.extend(f"- {quote_html(str(item))}" for item in tasks)
     if key_points:
         lines.append("")
-        lines.append(hbold("Ключевые тезисы"))
+        lines.append(hbold("Ключевые пункты"))
         lines.extend(f"- {quote_html(str(item))}" for item in key_points)
-    questions = loads(row["open_questions_json"])
+    if row["next_step"]:
+        lines.extend(["", f"{hbold('Следующий шаг')}: {quote_html(row['next_step'])}"])
     if questions:
         lines.append("")
         lines.append(hbold("Открытые вопросы"))
         lines.extend(f"- {quote_html(str(item))}" for item in questions)
-    if row["next_step"]:
-        lines.extend(["", f"{hbold('Следующий шаг')}: {quote_html(row['next_step'])}"])
-    if row["side_thoughts"]:
-        lines.extend(["", f"{hbold('Побочные мысли')}: {quote_html(row['side_thoughts'])}"])
+    lines.extend(["", f"{hbold('Категория')}: {quote_html(row['category'] or 'Без категории')}"])
     if tags:
         lines.extend(["", quote_html(tags)])
     return "\n".join(lines)
@@ -60,13 +92,51 @@ def idea_text(row) -> str:
 
 def compact_list(rows) -> str:
     if not rows:
-        return "Идей пока нет."
+        return "Пока мыслей нет."
     lines = []
     for row in rows:
-        pinned = " [закреплено]" if row["pinned_at"] else ""
-        category = row["category"] or "Без категории"
-        lines.append(f"#{row['id']} {quote_html(row['title'])}{pinned}\n{hitalic(quote_html(category))}")
+        summary = summary_for_card(row)
+        lines.append(f"#{row['id']} {TYPE_EMOJI.get(entry_type(row), '🧠')} {quote_html(row['title'])}\n{hitalic(summary)}")
     return "\n\n".join(lines)
+
+
+def next_steps_text(rows) -> str:
+    if not rows:
+        return "Пока нет выделенных следующих шагов."
+    lines = [hbold("Следующие шаги")]
+    for row in rows:
+        lines.extend(["", f"#{row['id']} {quote_html(row['title'])}"])
+        tasks = loads(row["tasks_json"])
+        if row["next_step"]:
+            lines.append(f"- {quote_html(row['next_step'])}")
+        for task in tasks:
+            task_text = str(task).strip()
+            if task_text and task_text != row["next_step"]:
+                lines.append(f"- {quote_html(task_text)}")
+    return "\n".join(lines)
+
+
+def album_caption(row) -> str:
+    summary = summary_for_card(row)
+    lines = [
+        f"🖼 {hbold(row['title'])}",
+        f"{hbold('Карточка')}: #{row['id']}",
+    ]
+    if summary:
+        lines.extend(["", quote_html(summary[:500])])
+    if row["photo_ocr_text"]:
+        ocr = " ".join(str(row["photo_ocr_text"]).split())
+        lines.extend(["", f"{hbold('Текст с фото')}: {quote_html(ocr[:250])}"])
+    return "\n".join(lines)
+
+
+def album_list_text(rows) -> str:
+    if not rows:
+        return "Альбом пока пуст."
+    lines = [hbold("Альбом")]
+    for row in rows:
+        lines.append(f"#{row['id']} {quote_html(row['title'])}")
+    return "\n".join(lines)
 
 
 def digest_text(user, rows) -> str:
@@ -115,13 +185,45 @@ def period_since(period: str, timezone_name: str = "Europe/Moscow") -> str:
 
 def usage_help() -> str:
     return (
-        "Отправьте текст, голосовое, пересланное сообщение или фото с подписью. "
-        "Я сохраню мысль почти дословно. Анализ можно запустить отдельной кнопкой под карточкой.\n\n"
-        "Категорию можно добавить сразу: «идея про лендинг категория: маркетинг» или следующим сообщением: «категория маркетинг».\n\n"
-        f"{hcode('/list')} - последние 10 идей\n"
+        "Как пользоваться ботом:\n\n"
+        "1. Просто отправляй сюда любые мысли.\n\n"
+        "Это может быть:\n"
+        "- короткая заметка\n"
+        "- длинный текст\n"
+        "- голосовое сообщение\n"
+        "- фото\n"
+        "- ссылка\n"
+        "- пересланное сообщение\n\n"
+        "2. Не нужно ничего сортировать.\n\n"
+        "Если в одном сообщении несколько идей, бот сам разделит их на отдельные карточки.\n\n"
+        "3. AI автоматически делает summary, выделяет задачи, предлагает следующий шаг и определяет категорию.\n\n"
+        "4. Все записи сохраняются в «Мысли». Там можно всё просматривать, искать и убирать ненужное в архив.\n\n"
+        "Фото попадают в альбом. Там их можно посмотреть и удалить при необходимости.\n\n"
+        "Главная идея - быстро выгружать мысли из головы, а не тратить время на организацию.\n\n"
+        f"{hcode('/list')} - мысли\n"
         f"{hcode('/search запрос')} - поиск\n"
-        f"{hcode('/category')} - идеи по категории\n"
-        f"{hcode('/today')} {hcode('/week')} {hcode('/month')} - идеи за период\n"
-        f"{hcode('/categories')} - категории\n"
-        f"{hcode('/settings')} - дайджест и часовой пояс"
+        f"{hcode('/next')} - следующие шаги\n"
+        f"{hcode('/album')} - альбом фото\n"
+        f"{hcode('/archive')} - архив\n"
+        f"{hcode('/settings')} - настройки"
+    )
+
+
+def start_text() -> str:
+    return (
+        f"{hbold('Привет.')}\n\n"
+        "Это место для мыслей, задач и идей.\n"
+        "Сюда можно быстро скинуть всё, что не хочется держать в голове.\n\n"
+        f"{hbold('Что можно отправлять:')}\n"
+        "• текст\n"
+        "• голосовые\n"
+        "• фото\n"
+        "• ссылки\n"
+        "• пересланные сообщения\n\n"
+        f"{hbold('Что я сделаю:')}\n"
+        "• разберу мысли\n"
+        "• выделю задачи\n"
+        "• сделаю короткое summary\n"
+        "• предложу следующий шаг\n\n"
+        "Можно прислать даже длинное хаотичное сообщение - AI сам разложит его на отдельные идеи."
     )

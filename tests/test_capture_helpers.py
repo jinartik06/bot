@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from src.ai import IdeaAI
 from src.config import Config
 from src.db import Database
-from src.main import category_name_from_chat_text, parse_admin_user_input, split_category_hint
+from src.main import category_name_from_chat_text, delete_local_photo, merge_photo_text, parse_admin_user_input, safe_photo_name, split_category_hint
 
 
 def make_config() -> Config:
@@ -61,11 +61,60 @@ class CaptureHelperTests(unittest.TestCase):
         self.assertEqual(payload["category"], "продукт")
         self.assertIsNone(payload["summary"])
         self.assertEqual(payload["key_points"], [])
+        self.assertEqual(payload["tasks"], [])
         self.assertEqual(payload["tags"], [])
+
+    def test_fallback_entries_split_bulleted_message(self) -> None:
+        ai = IdeaAI(make_config())
+
+        entries = ai._fallback_entries(
+            "- Надо подготовить wireframe главного экрана\n"
+            "- Идея сделать поиск по всем заметкам\n"
+            "- Купить микрофон для голосовых тестов",
+            "text",
+        )
+
+        self.assertEqual(len(entries), 3)
+        self.assertEqual(entries[0]["type"], "Задача")
+        self.assertEqual(entries[2]["type"], "Покупка")
 
     def test_parse_admin_user_input(self) -> None:
         self.assertEqual(parse_admin_user_input("123456 спам"), (123456, "спам"))
         self.assertEqual(parse_admin_user_input("123456"), (123456, None))
+
+    def test_photo_text_merges_caption_and_ocr(self) -> None:
+        self.assertEqual(
+            merge_photo_text("идея по экрану", "Мысли и поиск"),
+            "идея по экрану\n\nТекст с фото: Мысли и поиск",
+        )
+        self.assertEqual(merge_photo_text("", "Мысли и поиск"), "Фото.\n\nТекст с фото: Мысли и поиск")
+        self.assertEqual(merge_photo_text("", None), "Фото без подписи.")
+
+    def test_safe_photo_name_sanitizes_unique_id_and_extension(self) -> None:
+        self.assertEqual(
+            safe_photo_name(10, "abc/../x", ".png"),
+            Path("10") / "abc_x.png",
+        )
+        self.assertEqual(
+            safe_photo_name(10, "abc", ".exe"),
+            Path("10") / "abc.jpg",
+        )
+
+    def test_delete_local_photo_only_inside_storage_dir(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            base = Path(tmpdir) / "photos"
+            base.mkdir()
+            inside = base / "photo.jpg"
+            outside = Path(tmpdir) / "outside.jpg"
+            inside.write_bytes(b"photo")
+            outside.write_bytes(b"photo")
+            config = make_config()
+            object.__setattr__(config, "photo_storage_dir", base)
+
+            self.assertTrue(delete_local_photo(str(inside), config))
+            self.assertFalse(inside.exists())
+            self.assertFalse(delete_local_photo(str(outside), config))
+            self.assertTrue(outside.exists())
 
 
 class ProcessedMessageTests(unittest.IsolatedAsyncioTestCase):
@@ -158,6 +207,82 @@ class ProcessedMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(row["pinned_at"])
         self.assertEqual(row["pinned_chat_id"], 1000)
         self.assertEqual(row["pinned_message_id"], 2000)
+
+    async def test_archive_hides_idea_from_list_and_search(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "ideas.db")
+            await db.connect()
+            try:
+                await db.upsert_user(10, "user", "User", "Europe/Moscow", 6, "19:00")
+                idea_id = await db.create_idea(
+                    10,
+                    {
+                        "type": "Задача",
+                        "title": "Проверить мысли",
+                        "summary": "Проверить, что архив скрывает запись.",
+                        "tasks": ["Проверить архив"],
+                        "next_step": "Открыть архив",
+                        "category": "Работа",
+                        "key_points": [],
+                        "open_questions": [],
+                        "tags": [],
+                    },
+                    "Проверить мысли",
+                    "text",
+                    None,
+                )
+                await db.archive_idea(10, idea_id)
+                ideas = await db.list_ideas(10)
+                search = await db.search_ideas(10, "мысли")
+                archived = await db.archived_ideas(10)
+                steps = await db.next_step_ideas(10)
+            finally:
+                await db.close()
+
+        self.assertEqual(ideas, [])
+        self.assertEqual(search, [])
+        self.assertEqual(steps, [])
+        self.assertEqual(len(archived), 1)
+        self.assertIsNotNone(archived[0]["archived_at"])
+
+    async def test_album_lists_and_removes_uploaded_photo(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "ideas.db")
+            await db.connect()
+            try:
+                await db.upsert_user(10, "user", "User", "Europe/Moscow", 6, "19:00")
+                idea_id = await db.create_idea(
+                    10,
+                    {
+                        "type": "Идея",
+                        "title": "Фото доски",
+                        "summary": "На фото схема раздела мыслей.",
+                        "tasks": [],
+                        "category": "Идеи",
+                        "key_points": [],
+                        "open_questions": [],
+                        "tags": [],
+                    },
+                    "Фото доски",
+                    "photo",
+                    "telegram-file-id",
+                    "data/photos/10/photo.jpg",
+                    "Мысли, поиск, архив",
+                )
+                album_before = await db.album_photos(10)
+                removed = await db.remove_idea_photo(10, idea_id)
+                album_after = await db.album_photos(10)
+                row = await db.get_idea(10, idea_id)
+            finally:
+                await db.close()
+
+        self.assertEqual(len(album_before), 1)
+        self.assertEqual(album_before[0]["photo_ocr_text"], "Мысли, поиск, архив")
+        self.assertIsNotNone(removed)
+        self.assertEqual(album_after, [])
+        self.assertIsNone(row["photo_file_id"])
+        self.assertIsNone(row["photo_path"])
+        self.assertIsNone(row["photo_ocr_text"])
 
 
 if __name__ == "__main__":

@@ -107,11 +107,13 @@ class Database:
             CREATE TABLE IF NOT EXISTS ideas (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER NOT NULL,
+                entry_type TEXT,
                 title TEXT NOT NULL,
                 summary TEXT,
                 tldr TEXT,
                 full_text TEXT,
                 key_points_json TEXT NOT NULL DEFAULT '[]',
+                tasks_json TEXT NOT NULL DEFAULT '[]',
                 open_questions_json TEXT NOT NULL DEFAULT '[]',
                 next_step TEXT,
                 side_thoughts TEXT,
@@ -120,10 +122,13 @@ class Database:
                 original_text TEXT NOT NULL,
                 source_type TEXT NOT NULL,
                 priority_fire INTEGER NOT NULL DEFAULT 0,
+                archived_at TEXT,
                 pinned_at TEXT,
                 pinned_chat_id INTEGER,
                 pinned_message_id INTEGER,
                 photo_file_id TEXT,
+                photo_path TEXT,
+                photo_ocr_text TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -157,6 +162,11 @@ class Database:
         await self.ensure_column("ideas", "pinned_at", "TEXT")
         await self.ensure_column("ideas", "pinned_chat_id", "INTEGER")
         await self.ensure_column("ideas", "pinned_message_id", "INTEGER")
+        await self.ensure_column("ideas", "entry_type", "TEXT")
+        await self.ensure_column("ideas", "tasks_json", "TEXT NOT NULL DEFAULT '[]'")
+        await self.ensure_column("ideas", "archived_at", "TEXT")
+        await self.ensure_column("ideas", "photo_path", "TEXT")
+        await self.ensure_column("ideas", "photo_ocr_text", "TEXT")
         await self.db.commit()
 
     async def ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -393,7 +403,7 @@ class Database:
             """
             SELECT c.id, c.name, COUNT(i.id) AS ideas_count
             FROM categories c
-            LEFT JOIN ideas i ON i.category_id = c.id
+            LEFT JOIN ideas i ON i.category_id = c.id AND i.archived_at IS NULL
             WHERE c.user_id = ?
             GROUP BY c.id
             ORDER BY c.name
@@ -402,26 +412,38 @@ class Database:
         )
         return await cur.fetchall()
 
-    async def create_idea(self, user_id: int, payload: dict[str, Any], original_text: str, source_type: str, photo_file_id: str | None) -> int:
+    async def create_idea(
+        self,
+        user_id: int,
+        payload: dict[str, Any],
+        original_text: str,
+        source_type: str,
+        photo_file_id: str | None,
+        photo_path: str | None = None,
+        photo_ocr_text: str | None = None,
+    ) -> int:
         category_id = await self.ensure_category(user_id, payload.get("category") or "Без категории")
         now = utc_now()
         cur = await self.db.execute(
             """
             INSERT INTO ideas (
-                user_id, title, summary, tldr, full_text, key_points_json,
-                open_questions_json, next_step, side_thoughts, category_id,
+                user_id, entry_type, title, summary, tldr, full_text, key_points_json,
+                tasks_json, open_questions_json, next_step, side_thoughts, category_id,
                 tags_json, original_text, source_type, priority_fire, pinned_at,
-                pinned_chat_id, pinned_message_id, photo_file_id, created_at, updated_at
+                pinned_chat_id, pinned_message_id, photo_file_id, photo_path, photo_ocr_text,
+                archived_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
+                payload.get("type") or payload.get("entry_type") or "Мысль",
                 (payload.get("title") or "Новая идея").strip()[:180],
                 payload.get("summary"),
                 payload.get("tldr"),
                 payload.get("full_text"),
                 dumps(payload.get("key_points")),
+                dumps(payload.get("tasks")),
                 dumps(payload.get("open_questions")),
                 payload.get("next_step"),
                 payload.get("side_thoughts"),
@@ -434,6 +456,9 @@ class Database:
                 None,
                 None,
                 photo_file_id,
+                photo_path,
+                photo_ocr_text,
+                None,
                 now,
                 now,
             ),
@@ -497,7 +522,7 @@ class Database:
             SELECT i.*, c.name AS category
             FROM ideas i
             LEFT JOIN categories c ON c.id = i.category_id
-            WHERE i.user_id = ?
+            WHERE i.user_id = ? AND i.archived_at IS NULL
             ORDER BY i.created_at DESC
             LIMIT ?
             """,
@@ -511,7 +536,7 @@ class Database:
             SELECT i.*, c.name AS category
             FROM ideas i
             LEFT JOIN categories c ON c.id = i.category_id
-            WHERE i.user_id = ?
+            WHERE i.user_id = ? AND i.archived_at IS NULL
             ORDER BY i.created_at DESC
             LIMIT 1
             """,
@@ -526,14 +551,16 @@ class Database:
             FROM ideas i
             LEFT JOIN categories c ON c.id = i.category_id
             WHERE i.user_id = ?
+              AND i.archived_at IS NULL
               AND (
                 i.title LIKE ? OR i.summary LIKE ? OR i.tldr LIKE ? OR
-                i.full_text LIKE ? OR i.original_text LIKE ? OR i.tags_json LIKE ?
+                i.full_text LIKE ? OR i.original_text LIKE ? OR i.tags_json LIKE ? OR
+                i.next_step LIKE ? OR i.tasks_json LIKE ? OR i.photo_ocr_text LIKE ?
               )
             ORDER BY i.created_at DESC
             LIMIT 20
             """,
-            (user_id, like, like, like, like, like, like),
+            (user_id, like, like, like, like, like, like, like, like, like),
         )
         return await cur.fetchall()
 
@@ -543,7 +570,7 @@ class Database:
             SELECT i.*, c.name AS category
             FROM ideas i
             LEFT JOIN categories c ON c.id = i.category_id
-            WHERE i.user_id = ? AND i.created_at >= ?
+            WHERE i.user_id = ? AND i.created_at >= ? AND i.archived_at IS NULL
             ORDER BY i.created_at DESC
             """,
             (user_id, since_iso),
@@ -556,12 +583,96 @@ class Database:
             SELECT i.*, c.name AS category
             FROM ideas i
             LEFT JOIN categories c ON c.id = i.category_id
-            WHERE i.user_id = ? AND i.category_id = ?
+            WHERE i.user_id = ? AND i.category_id = ? AND i.archived_at IS NULL
             ORDER BY i.created_at DESC
             """,
             (user_id, category_id),
         )
         return await cur.fetchall()
+
+    async def next_step_ideas(self, user_id: int, limit: int = 30) -> list[aiosqlite.Row]:
+        cur = await self.db.execute(
+            """
+            SELECT i.*, c.name AS category
+            FROM ideas i
+            LEFT JOIN categories c ON c.id = i.category_id
+            WHERE i.user_id = ?
+              AND i.archived_at IS NULL
+              AND (
+                NULLIF(TRIM(COALESCE(i.next_step, '')), '') IS NOT NULL
+                OR i.tasks_json NOT IN ('[]', '', 'null')
+              )
+            ORDER BY i.created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        return await cur.fetchall()
+
+    async def archived_ideas(self, user_id: int, limit: int = 20) -> list[aiosqlite.Row]:
+        cur = await self.db.execute(
+            """
+            SELECT i.*, c.name AS category
+            FROM ideas i
+            LEFT JOIN categories c ON c.id = i.category_id
+            WHERE i.user_id = ? AND i.archived_at IS NOT NULL
+            ORDER BY i.archived_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        return await cur.fetchall()
+
+    async def album_photos(self, user_id: int, limit: int = 30) -> list[aiosqlite.Row]:
+        cur = await self.db.execute(
+            """
+            SELECT i.*, c.name AS category
+            FROM ideas i
+            LEFT JOIN categories c ON c.id = i.category_id
+            WHERE i.user_id = ?
+              AND (
+                NULLIF(TRIM(COALESCE(i.photo_file_id, '')), '') IS NOT NULL
+                OR NULLIF(TRIM(COALESCE(i.photo_path, '')), '') IS NOT NULL
+              )
+            ORDER BY i.created_at DESC
+            LIMIT ?
+            """,
+            (user_id, limit),
+        )
+        return await cur.fetchall()
+
+    async def remove_idea_photo(self, user_id: int, idea_id: int) -> aiosqlite.Row | None:
+        row = await self.get_idea(user_id, idea_id)
+        if not row or not (row["photo_file_id"] or row["photo_path"]):
+            return None
+        await self.db.execute(
+            """
+            UPDATE ideas
+            SET photo_file_id = NULL,
+                photo_path = NULL,
+                photo_ocr_text = NULL,
+                updated_at = ?
+            WHERE user_id = ? AND id = ?
+            """,
+            (utc_now(), user_id, idea_id),
+        )
+        await self.db.commit()
+        return row
+
+    async def archive_idea(self, user_id: int, idea_id: int) -> None:
+        now = utc_now()
+        await self.db.execute(
+            "UPDATE ideas SET archived_at = ?, updated_at = ? WHERE user_id = ? AND id = ?",
+            (now, now, user_id, idea_id),
+        )
+        await self.db.commit()
+
+    async def restore_idea(self, user_id: int, idea_id: int) -> None:
+        await self.db.execute(
+            "UPDATE ideas SET archived_at = NULL, updated_at = ? WHERE user_id = ? AND id = ?",
+            (utc_now(), user_id, idea_id),
+        )
+        await self.db.commit()
 
     async def delete_idea(self, user_id: int, idea_id: int) -> None:
         await self.db.execute("DELETE FROM ideas WHERE user_id = ? AND id = ?", (user_id, idea_id))
@@ -601,11 +712,13 @@ class Database:
         await self.db.execute(
             """
             UPDATE ideas
-            SET title = ?,
+            SET entry_type = ?,
+                title = ?,
                 summary = ?,
                 tldr = ?,
                 full_text = ?,
                 key_points_json = ?,
+                tasks_json = ?,
                 open_questions_json = ?,
                 next_step = ?,
                 side_thoughts = ?,
@@ -614,11 +727,13 @@ class Database:
             WHERE user_id = ? AND id = ?
             """,
             (
+                payload.get("type") or payload.get("entry_type") or "Мысль",
                 (payload.get("title") or "Новая мысль").strip()[:180],
                 payload.get("summary"),
                 payload.get("tldr"),
                 payload.get("full_text"),
                 dumps(payload.get("key_points")),
+                dumps(payload.get("tasks")),
                 dumps(payload.get("open_questions")),
                 payload.get("next_step"),
                 payload.get("side_thoughts"),
