@@ -47,7 +47,7 @@ def idea_text(row) -> str:
     ]
     summary = summary_for_card(row)
     if summary:
-        lines.extend(["", f"{hbold('Summary')}: {quote_html(summary)}"])
+        lines.extend(["", f"{hbold('Коротко')}: {quote_html(summary)}"])
     if row["next_step"]:
         lines.extend(["", f"{hbold('Следующий шаг')}: {quote_html(row['next_step'])}"])
     return "\n".join(lines)
@@ -67,7 +67,7 @@ def idea_details_text(row) -> str:
         quote_html(row["full_text"] or row["original_text"]),
     ]
     if row["summary"] or row["tldr"]:
-        lines.extend(["", f"{hbold('Summary')}: {quote_html(row['summary'] or row['tldr'])}"])
+        lines.extend(["", f"{hbold('Коротко')}: {quote_html(row['summary'] or row['tldr'])}"])
     if "photo_ai_text" in row.keys() and row["photo_ai_text"]:
         lines.extend(["", hbold("AI-описание фото"), quote_html(row["photo_ai_text"])])
     if "photo_ocr_text" in row.keys() and row["photo_ocr_text"]:
@@ -217,7 +217,7 @@ def usage_help() -> str:
         "- пересланное сообщение\n\n"
         "2. Не нужно ничего сортировать.\n\n"
         "Если в одном сообщении несколько идей, бот сам разделит их на отдельные карточки.\n\n"
-        "3. AI автоматически делает summary, выделяет задачи, предлагает следующий шаг и определяет категорию.\n\n"
+        "3. AI автоматически пишет «Коротко», выделяет задачи, предлагает следующий шаг и определяет категорию.\n\n"
         "4. Все записи сохраняются в «Мысли». Там можно всё просматривать, искать и убирать ненужное в архив.\n\n"
         "Фото попадают в альбом. Там их можно посмотреть и удалить при необходимости.\n\n"
         "Главная идея - быстро выгружать мысли из головы, а не тратить время на организацию.\n\n"
@@ -244,7 +244,7 @@ def start_text() -> str:
         f"{hbold('Что я сделаю:')}\n"
         "• разберу мысли\n"
         "• выделю задачи\n"
-        "• сделаю короткое summary\n"
+        "• напишу коротко по сути\n"
         "• предложу следующий шаг\n\n"
         "Можно прислать даже длинное хаотичное сообщение - AI сам разложит его на отдельные идеи."
     )
