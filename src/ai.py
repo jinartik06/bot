@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -18,6 +19,12 @@ from .groq_voice import GroqVoiceTranscriber
 
 
 logger = logging.getLogger("ideas_bot.ai")
+IMAGE_MIME_TYPES = {
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".webp": "image/webp",
+}
 
 
 class EmptyTranscriptError(RuntimeError):
@@ -333,6 +340,24 @@ class IdeaAI:
             "original_text": clean,
         }
 
+    def photo_without_text_payload(self, raw_text: str = "Фото без подписи, AI-описания и распознанного текста.") -> dict[str, Any]:
+        clean = raw_text.strip() or "Фото без подписи, AI-описания и распознанного текста."
+        return {
+            "type": "Наблюдение",
+            "title": "Фото без подписи",
+            "summary": "Фото сохранено в альбом. Подписи, AI-описания или распознанного текста нет, поэтому я не придумываю содержание изображения.",
+            "tldr": None,
+            "full_text": None,
+            "key_points": [],
+            "tasks": [],
+            "open_questions": [],
+            "next_step": None,
+            "side_thoughts": None,
+            "category": "Личное",
+            "tags": ["фото", "альбом"],
+            "original_text": clean,
+        }
+
     async def structure_entries(
         self,
         raw_text: str,
@@ -435,6 +460,117 @@ class IdeaAI:
                     raise RuntimeError("Groq Responses API returned non-JSON response") from exc
         return self._extract_response_text(data)
 
+    async def describe_photo(self, path: Path, caption: str = "", ocr_text: str | None = None) -> str | None:
+        if not self.config.photo_vision_enabled or not self.has_api():
+            return None
+        if not path.exists() or not path.is_file():
+            return None
+
+        suffix = path.suffix.lower()
+        mime_type = IMAGE_MIME_TYPES.get(suffix, "image/jpeg")
+        try:
+            image_bytes = await asyncio.to_thread(path.read_bytes)
+            image_b64 = base64.b64encode(image_bytes).decode("ascii")
+            content = await self._create_photo_response(
+                self._photo_prompt(caption, ocr_text),
+                f"data:{mime_type};base64,{image_b64}",
+            )
+        except Exception:
+            logger.exception("Groq vision analysis failed, continuing without image description")
+            return None
+
+        clean = " ".join(content.split())
+        return clean[:1200] or None
+
+    async def _create_photo_response(self, prompt: str, image_url: str) -> str:
+        try:
+            return await self._create_photo_response_via_responses(prompt, image_url)
+        except Exception as exc:
+            logger.info("Groq Responses vision request failed, trying chat completions: %s", exc)
+            return await self._create_photo_response_via_chat(prompt, image_url)
+
+    async def _create_photo_response_via_responses(self, prompt: str, image_url: str) -> str:
+        payload: dict[str, Any] = {
+            "model": self.config.groq_vision_model,
+            "input": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": image_url},
+                    ],
+                }
+            ],
+            "temperature": 0.1,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.config.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.config.groq_base_url.rstrip('/')}/openai/v1/responses"
+        timeout = aiohttp.ClientTimeout(total=max(5, self.config.photo_vision_timeout_seconds))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                text = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Groq vision Responses API failed with HTTP {response.status}: {text[:500]}")
+                data = json.loads(text)
+        return self._extract_response_text(data)
+
+    async def _create_photo_response_via_chat(self, prompt: str, image_url: str) -> str:
+        payload: dict[str, Any] = {
+            "model": self.config.groq_vision_model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 700,
+        }
+        headers = {
+            "Authorization": f"Bearer {self.config.groq_api_key}",
+            "Content-Type": "application/json",
+        }
+        url = f"{self.config.groq_base_url.rstrip('/')}/openai/v1/chat/completions"
+        timeout = aiohttp.ClientTimeout(total=max(5, self.config.photo_vision_timeout_seconds))
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, headers=headers, json=payload) as response:
+                text = await response.text()
+                if response.status >= 400:
+                    raise RuntimeError(f"Groq vision Chat API failed with HTTP {response.status}: {text[:500]}")
+                data = json.loads(text)
+        choice = (data.get("choices") or [{}])[0]
+        message = choice.get("message") or {}
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            return content
+        raise RuntimeError("Groq vision Chat API returned no content")
+
+    def _photo_prompt(self, caption: str, ocr_text: str | None) -> str:
+        caption = caption.strip() or "нет"
+        ocr_text = " ".join(str(ocr_text or "").split()) or "нет"
+        return f"""
+Ты разбираешь фото для личного inbox мыслей.
+
+Нужно:
+- коротко описать, что реально видно на изображении;
+- отдельно упомянуть важные объекты, экран, документ, чек, вывеску, схему или интерфейс, если они видны;
+- переписать видимый текст с фото, если он читается;
+- учитывать подпись и OCR ниже, но не дублировать одно и то же длинно;
+- если в чём-то не уверен, так и напиши: "похоже".
+
+Не придумывай людей, места, бренды, даты, суммы и задачи, если они не видны на фото и не указаны в подписи/OCR.
+Ответь по-русски обычным текстом, максимум 6 коротких пунктов, без JSON и markdown.
+
+Подпись пользователя: {caption}
+OCR Tesseract: {ocr_text}
+"""
+
     def _extract_response_text(self, data: dict[str, Any]) -> str:
         output_text = data.get("output_text")
         if isinstance(output_text, str) and output_text.strip():
@@ -467,6 +603,12 @@ Photo as context: {"yes" if has_photo else "no"}
 
 Product behavior:
 The bot is a simple place for thoughts. The user should not sort anything manually.
+
+Photo rule:
+If Source is photo, analyze only the caption, AI image description and OCR text provided in Original text.
+Visual details are allowed only when they appear in "AI-описание фото"; text from the image is allowed only when it appears in OCR or the AI image description.
+Do not invent objects, people, colors, layout, handwriting, documents, products or scene details beyond those inputs.
+If Original text says "Фото без подписи, AI-описания и распознанного текста.", return exactly one simple card: type "Наблюдение", title "Фото без подписи", summary "Фото сохранено в альбом. Подписи, AI-описания или распознанного текста нет, поэтому я не придумываю содержание изображения.", tasks [], next_step null.
 
 Task:
 1. Clean filler sounds and filler words, but preserve meaning and useful details.
@@ -537,6 +679,11 @@ For a long detailed idea fill:
         return f"""
 Source: {source_type}
 Photo as context: {"yes" if has_photo else "no"}
+
+Photo rule:
+If Source is photo, analyze only the caption, AI image description and OCR text provided in Original text.
+Do not describe visual details unless they are explicitly present in "AI-описание фото", OCR or caption.
+If Original text says "Фото без подписи, AI-описания и распознанного текста.", return type "Наблюдение", title "Фото без подписи", no tasks and next_step null.
 
 Task:
 1. Remove filler sounds, hesitation noises and filler words such as "эээ", "ммм", "эм", "ну", "типа", "как бы", "короче"; preserve vivid meaningful phrasing.

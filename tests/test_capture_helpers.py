@@ -7,7 +7,9 @@ from tempfile import TemporaryDirectory
 from src.ai import IdeaAI
 from src.config import Config
 from src.db import Database
-from src.main import category_name_from_chat_text, delete_local_photo, merge_photo_text, parse_admin_user_input, safe_photo_name, split_category_hint
+from src.keyboards import main_menu, next_step_actions, start_menu
+from src.main import build_continuation_text, category_name_from_chat_text, delete_local_photo, merge_photo_text, parse_admin_user_input, photo_has_text_context, safe_photo_name, split_category_hint
+from src.render import next_step_item_text, next_steps_text
 
 
 def make_config() -> Config:
@@ -23,6 +25,7 @@ def make_config() -> Config:
         default_digest_weekday=6,
         default_digest_time="19:00",
         groq_text_model="qwen/qwen3-32b",
+        groq_vision_model="meta-llama/llama-4-scout-17b-16e-instruct",
         groq_transcribe_model="whisper-large-v3-turbo",
         voice_transcriber="faster_whisper",
         short_input_char_limit=900,
@@ -84,11 +87,85 @@ class CaptureHelperTests(unittest.TestCase):
 
     def test_photo_text_merges_caption_and_ocr(self) -> None:
         self.assertEqual(
-            merge_photo_text("идея по экрану", "Мысли и поиск"),
-            "идея по экрану\n\nТекст с фото: Мысли и поиск",
+            merge_photo_text("идея по экрану", "Мысли и поиск", "На фото интерфейс заметок"),
+            "Подпись к фото: идея по экрану\n\nAI-описание фото: На фото интерфейс заметок\n\nТекст, распознанный на фото: Мысли и поиск",
         )
-        self.assertEqual(merge_photo_text("", "Мысли и поиск"), "Фото.\n\nТекст с фото: Мысли и поиск")
-        self.assertEqual(merge_photo_text("", None), "Фото без подписи.")
+        self.assertEqual(merge_photo_text("", "Мысли и поиск"), "Текст, распознанный на фото: Мысли и поиск")
+        self.assertEqual(merge_photo_text("", None, "На фото чек"), "AI-описание фото: На фото чек")
+        self.assertEqual(merge_photo_text("", None), "Фото без подписи, AI-описания и распознанного текста.")
+
+    def test_photo_context_detection_uses_caption_or_ocr(self) -> None:
+        self.assertTrue(photo_has_text_context("подпись", None))
+        self.assertTrue(photo_has_text_context("", "текст на фото"))
+        self.assertTrue(photo_has_text_context("", None, "описание картинки"))
+        self.assertFalse(photo_has_text_context("", None))
+
+    def test_photo_without_text_payload_does_not_invent_visual_content(self) -> None:
+        ai = IdeaAI(make_config())
+
+        payload = ai.photo_without_text_payload()
+
+        self.assertEqual(payload["title"], "Фото без подписи")
+        self.assertEqual(payload["type"], "Наблюдение")
+        self.assertEqual(payload["tasks"], [])
+        self.assertIsNone(payload["next_step"])
+        self.assertIn("не придумываю", payload["summary"])
+
+    def test_photo_prompt_forbids_visual_guessing(self) -> None:
+        ai = IdeaAI(make_config())
+
+        prompt = ai._entries_prompt("AI-описание фото: На фото заметки.", "photo", True, "short")
+
+        self.assertIn("AI image description", prompt)
+        self.assertIn("Do not invent objects", prompt)
+
+    def test_start_menu_shows_admin_tab_for_admins(self) -> None:
+        regular_texts = [button.text for row in start_menu().inline_keyboard for button in row]
+        admin_texts = [button.text for row in start_menu(is_admin=True).inline_keyboard for button in row]
+
+        self.assertNotIn("🛡 Админка", regular_texts)
+        self.assertIn("🛡 Админка", admin_texts)
+
+    def test_next_step_card_has_continue_action(self) -> None:
+        markup = next_step_actions(42)
+        texts = [button.text for row in markup.inline_keyboard for button in row]
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+
+        self.assertIn("Продолжить", texts)
+        self.assertIn("idea:continue:42", callbacks)
+
+    def test_continue_thought_menu_copy_is_friendly(self) -> None:
+        menu_texts = [button.text for row in main_menu().inline_keyboard for button in row]
+
+        self.assertIn("✍️ Продолжить мысль", menu_texts)
+        self.assertIn("Продолжить мысль", next_steps_text([{"id": 1}]))
+        self.assertIn("Пока нет мыслей", next_steps_text([]))
+
+    def test_next_step_item_text_shows_action_items(self) -> None:
+        text = next_step_item_text(
+            {
+                "id": 5,
+                "entry_type": "Задача",
+                "title": "Проверить фото",
+                "next_step": "Открыть карточку",
+                "tasks_json": '["Открыть карточку", "Проверить OCR"]',
+                "summary": "Нужно проверить распознавание.",
+                "tldr": None,
+                "full_text": None,
+                "original_text": "Нужно проверить распознавание.",
+            }
+        )
+
+        self.assertIn("Открыть карточку", text)
+        self.assertIn("Проверить OCR", text)
+
+    def test_build_continuation_text_keeps_original_and_new_context(self) -> None:
+        text = build_continuation_text("Сделать экран мыслей", "Добавить выбор из следующих шагов")
+
+        self.assertIn("Исходная мысль", text)
+        self.assertIn("Сделать экран мыслей", text)
+        self.assertIn("Продолжение пользователя", text)
+        self.assertIn("Добавить выбор", text)
 
     def test_safe_photo_name_sanitizes_unique_id_and_extension(self) -> None:
         self.assertEqual(
@@ -268,8 +345,10 @@ class ProcessedMessageTests(unittest.IsolatedAsyncioTestCase):
                     "telegram-file-id",
                     "data/photos/10/photo.jpg",
                     "Мысли, поиск, архив",
+                    "На фото схема раздела мыслей",
                 )
                 album_before = await db.album_photos(10)
+                search = await db.search_ideas(10, "схема")
                 removed = await db.remove_idea_photo(10, idea_id)
                 album_after = await db.album_photos(10)
                 row = await db.get_idea(10, idea_id)
@@ -278,11 +357,58 @@ class ProcessedMessageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(len(album_before), 1)
         self.assertEqual(album_before[0]["photo_ocr_text"], "Мысли, поиск, архив")
+        self.assertEqual(album_before[0]["photo_ai_text"], "На фото схема раздела мыслей")
+        self.assertEqual(len(search), 1)
         self.assertIsNotNone(removed)
         self.assertEqual(album_after, [])
         self.assertIsNone(row["photo_file_id"])
         self.assertIsNone(row["photo_path"])
         self.assertIsNone(row["photo_ocr_text"])
+        self.assertIsNone(row["photo_ai_text"])
+
+    async def test_update_idea_analysis_can_store_continuation_text(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "ideas.db")
+            await db.connect()
+            try:
+                await db.upsert_user(10, "user", "User", "Europe/Moscow", 6, "19:00")
+                idea_id = await db.create_idea(
+                    10,
+                    {
+                        "type": "Задача",
+                        "title": "Старая задача",
+                        "summary": "Старый текст.",
+                        "tasks": [],
+                        "category": "Работа",
+                        "key_points": [],
+                        "open_questions": [],
+                        "tags": [],
+                    },
+                    "Старый текст",
+                    "text",
+                    None,
+                )
+                await db.update_idea_analysis(
+                    10,
+                    idea_id,
+                    {
+                        "type": "Задача",
+                        "title": "Обновленная задача",
+                        "summary": "Добавлен новый контекст.",
+                        "tasks": ["Проверить следующий шаг"],
+                        "next_step": "Проверить следующий шаг",
+                        "key_points": [],
+                        "open_questions": [],
+                        "tags": [],
+                    },
+                    original_text="Старый текст\n\nНовый контекст",
+                )
+                row = await db.get_idea(10, idea_id)
+            finally:
+                await db.close()
+
+        self.assertEqual(row["title"], "Обновленная задача")
+        self.assertIn("Новый контекст", row["original_text"])
 
 
 if __name__ == "__main__":

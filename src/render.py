@@ -68,6 +68,8 @@ def idea_details_text(row) -> str:
     ]
     if row["summary"] or row["tldr"]:
         lines.extend(["", f"{hbold('Summary')}: {quote_html(row['summary'] or row['tldr'])}"])
+    if "photo_ai_text" in row.keys() and row["photo_ai_text"]:
+        lines.extend(["", hbold("AI-описание фото"), quote_html(row["photo_ai_text"])])
     if "photo_ocr_text" in row.keys() and row["photo_ocr_text"]:
         lines.extend(["", hbold("Текст с фото"), quote_html(row["photo_ocr_text"])])
     if tasks:
@@ -102,17 +104,33 @@ def compact_list(rows) -> str:
 
 def next_steps_text(rows) -> str:
     if not rows:
-        return "Пока нет выделенных следующих шагов."
-    lines = [hbold("Следующие шаги")]
-    for row in rows:
-        lines.extend(["", f"#{row['id']} {quote_html(row['title'])}"])
-        tasks = loads(row["tasks_json"])
-        if row["next_step"]:
-            lines.append(f"- {quote_html(row['next_step'])}")
-        for task in tasks:
-            task_text = str(task).strip()
-            if task_text and task_text != row["next_step"]:
-                lines.append(f"- {quote_html(task_text)}")
+        return "Пока нет мыслей, которые хочется продолжить."
+    lines = [
+        hbold("Продолжить мысль"),
+        "Выбери мысль ниже: можно открыть подробности или нажать «Продолжить» и дописать новый контекст.",
+    ]
+    return "\n".join(lines)
+
+
+def next_step_item_text(row) -> str:
+    lines = [
+        f"#{row['id']} {TYPE_EMOJI.get(entry_type(row), '🧠')} {hbold(row['title'])}",
+    ]
+    if row["next_step"]:
+        lines.extend(["", f"{hbold('Следующий шаг')}: {quote_html(row['next_step'])}"])
+    tasks = loads(row["tasks_json"])
+    visible_tasks = []
+    for task in tasks:
+        task_text = str(task).strip()
+        if task_text and task_text != row["next_step"]:
+            visible_tasks.append(task_text)
+    if visible_tasks:
+        lines.append("")
+        lines.append(hbold("Задачи"))
+        lines.extend(f"- {quote_html(task)}" for task in visible_tasks[:5])
+    summary = summary_for_card(row)
+    if summary:
+        lines.extend(["", quote_html(summary[:500])])
     return "\n".join(lines)
 
 
@@ -124,6 +142,9 @@ def album_caption(row) -> str:
     ]
     if summary:
         lines.extend(["", quote_html(summary[:500])])
+    if "photo_ai_text" in row.keys() and row["photo_ai_text"]:
+        photo_text = " ".join(str(row["photo_ai_text"]).split())
+        lines.extend(["", f"{hbold('AI-описание')}: {quote_html(photo_text[:250])}"])
     if row["photo_ocr_text"]:
         ocr = " ".join(str(row["photo_ocr_text"]).split())
         lines.extend(["", f"{hbold('Текст с фото')}: {quote_html(ocr[:250])}"])
@@ -202,7 +223,7 @@ def usage_help() -> str:
         "Главная идея - быстро выгружать мысли из головы, а не тратить время на организацию.\n\n"
         f"{hcode('/list')} - мысли\n"
         f"{hcode('/search запрос')} - поиск\n"
-        f"{hcode('/next')} - следующие шаги\n"
+        f"{hcode('/next')} - продолжить мысль\n"
         f"{hcode('/album')} - альбом фото\n"
         f"{hcode('/archive')} - архив\n"
         f"{hcode('/settings')} - настройки"

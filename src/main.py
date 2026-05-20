@@ -25,7 +25,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import BotCommand, CallbackQuery, Message, TelegramObject
+from aiogram.types import BotCommand, BotCommandScopeChat, CallbackQuery, Message, TelegramObject
 from aiogram.utils.markdown import hbold, hcode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -39,11 +39,12 @@ from .keyboards import (
     categories_menu,
     idea_actions,
     main_menu,
+    next_step_actions,
     periods_menu,
     settings_menu,
     start_menu,
 )
-from .render import album_caption, album_list_text, compact_list, digest_text, idea_details_text, idea_text, next_steps_text, period_since, start_text, usage_help
+from .render import album_caption, album_list_text, compact_list, digest_text, idea_details_text, idea_text, next_step_item_text, next_steps_text, period_since, start_text, usage_help
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -55,6 +56,7 @@ VOICE_RUNTIME_LOCK = "voice_transcription"
 class Form(StatesGroup):
     waiting_name = State()
     search_query = State()
+    continue_idea = State()
     add_allowed = State()
     remove_allowed = State()
     block_user = State()
@@ -154,6 +156,7 @@ TRAILING_CATEGORY_RE = re.compile(
 URL_RE = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title>", re.IGNORECASE | re.DOTALL)
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
+PHOTO_WITHOUT_TEXT = "Фото без подписи, AI-описания и распознанного текста."
 
 
 def clean_category_name(value: str | None) -> str | None:
@@ -304,13 +307,22 @@ async def save_photo_and_ocr(message: Message, bot: Bot, config: Config) -> tupl
     return photo.file_id, str(target_path), ocr_text
 
 
-def merge_photo_text(caption: str, ocr_text: str | None) -> str:
+def merge_photo_text(caption: str, ocr_text: str | None, vision_text: str | None = None) -> str:
     caption = caption.strip()
-    if not ocr_text:
-        return caption or "Фото без подписи."
+    ocr_text = " ".join(str(ocr_text or "").split())
+    vision_text = " ".join(str(vision_text or "").split())
+    parts = []
     if caption:
-        return f"{caption}\n\nТекст с фото: {ocr_text}"
-    return f"Фото.\n\nТекст с фото: {ocr_text}"
+        parts.append(f"Подпись к фото: {caption}")
+    if vision_text:
+        parts.append(f"AI-описание фото: {vision_text}")
+    if ocr_text:
+        parts.append(f"Текст, распознанный на фото: {ocr_text}")
+    return "\n\n".join(parts) if parts else PHOTO_WITHOUT_TEXT
+
+
+def photo_has_text_context(caption: str, ocr_text: str | None, vision_text: str | None = None) -> bool:
+    return bool(caption.strip() or str(ocr_text or "").strip() or str(vision_text or "").strip())
 
 
 def delete_local_photo(photo_path: str | None, config: Config) -> bool:
@@ -341,6 +353,15 @@ async def send_archived_idea(message: Message, row) -> None:
     await send_chunks(message, idea_text(row), reply_markup=archived_idea_actions(row["id"]))
 
 
+async def send_next_steps(message: Message, rows) -> None:
+    if not rows:
+        await message.answer(next_steps_text(rows))
+        return
+    await message.answer(next_steps_text(rows))
+    for row in rows:
+        await send_chunks(message, next_step_item_text(row), reply_markup=next_step_actions(row["id"]))
+
+
 async def send_album_photo(message: Message, row) -> None:
     caption = album_caption(row)
     markup = album_photo_actions(row["id"])
@@ -351,6 +372,14 @@ async def send_album_photo(message: Message, row) -> None:
         except TelegramBadRequest as exc:
             logger.warning("Could not send album photo, falling back to text: %s", exc)
     await send_chunks(message, caption, reply_markup=markup)
+
+
+def build_continuation_text(original_text: str, continuation: str) -> str:
+    original = original_text.strip()
+    addition = continuation.strip()
+    if not original:
+        return addition
+    return f"Исходная мысль:\n{original}\n\nПродолжение пользователя:\n{addition}"
 
 
 async def delete_status_message(message: Message | None) -> None:
@@ -496,7 +525,8 @@ def format_blocked_users(rows) -> str:
 async def start(message: Message, state: FSMContext, db: Database, config: Config) -> None:
     await register_seen_user(message, db, config)
     await state.clear()
-    await message.answer(start_text(), reply_markup=start_menu())
+    user = await db.get_user(message.from_user.id)
+    await message.answer(start_text(), reply_markup=start_menu(user.is_admin if user else False))
 
 
 @router.message(Form.waiting_name, F.text)
@@ -543,7 +573,7 @@ async def search_cmd(message: Message, command: CommandObject, db: Database) -> 
 @router.message(Command("next", "steps"))
 async def next_cmd(message: Message, db: Database) -> None:
     rows = await db.next_step_ideas(message.from_user.id)
-    await message.answer(next_steps_text(rows))
+    await send_next_steps(message, rows)
 
 
 @router.message(Command("archive"))
@@ -634,7 +664,7 @@ async def nav_list(callback: CallbackQuery, db: Database) -> None:
 @router.callback_query(F.data == "nav:steps")
 async def nav_steps(callback: CallbackQuery, db: Database) -> None:
     rows = await db.next_step_ideas(callback.from_user.id)
-    await callback.message.answer(next_steps_text(rows))
+    await send_next_steps(callback.message, rows)
     await callback.answer()
 
 
@@ -882,6 +912,72 @@ async def analyze_idea(callback: CallbackQuery, db: Database, ai: IdeaAI) -> Non
         await edit_or_send_idea(callback, updated)
 
 
+@router.callback_query(F.data.startswith("idea:continue:"))
+async def continue_idea(callback: CallbackQuery, state: FSMContext, db: Database) -> None:
+    idea_id = int(callback.data.split(":")[2])
+    row = await db.get_idea(callback.from_user.id, idea_id)
+    if not row:
+        await callback.answer("Мысль не найдена", show_alert=True)
+        return
+    await state.update_data(continue_idea_id=idea_id)
+    await state.set_state(Form.continue_idea)
+    await callback.message.answer(
+        f"Продолжаем мысль #{idea_id}: {hbold(html.escape(row['title']))}\n"
+        "Напиши новый контекст, решение или следующий шаг. Я обновлю карточку."
+    )
+    await callback.answer()
+
+
+@router.message(Form.continue_idea, F.text)
+async def continue_idea_text(message: Message, state: FSMContext, db: Database, ai: IdeaAI) -> None:
+    if not await db.mark_message_processed(message.chat.id, message.message_id, message.from_user.id):
+        return
+    data = await state.get_data()
+    idea_id = int(data.get("continue_idea_id") or 0)
+    row = await db.get_idea(message.from_user.id, idea_id)
+    if not row:
+        await state.clear()
+        await message.answer("Не нашёл эту мысль. Открой «Продолжить мысль» и выбери её заново.")
+        return
+
+    continuation = (message.text or "").strip()
+    if not continuation:
+        await message.answer("Нужен текст продолжения. Можно написать «отмена», чтобы выйти.")
+        return
+    if continuation.lower() in {"отмена", "cancel", "/cancel"}:
+        await state.clear()
+        await message.answer("Ок, продолжение отменил.")
+        return
+
+    combined_text = build_continuation_text(row["original_text"], continuation)
+    status_message = await message.answer("Обновляю карточку с новым контекстом...")
+    try:
+        payload = await ai.structure_idea(
+            combined_text,
+            row["source_type"] or "text",
+            bool(row["photo_file_id"]),
+        )
+    except Exception:
+        logger.exception("Idea continuation analysis failed")
+        payload = ai.raw_idea_payload(combined_text, row["category"])
+
+    await db.update_idea_analysis(message.from_user.id, idea_id, payload, original_text=combined_text)
+    if payload.get("category"):
+        await db.update_idea_category(message.from_user.id, idea_id, str(payload["category"]))
+    await state.clear()
+    await delete_status_message(status_message)
+
+    updated = await db.get_idea(message.from_user.id, idea_id)
+    await message.answer("Готово, мысль обновлена.")
+    if updated:
+        await send_idea(message, updated)
+
+
+@router.message(Form.continue_idea)
+async def continue_idea_unsupported(message: Message) -> None:
+    await message.answer("Для продолжения этой мысли пришли текстом новый контекст или напиши «отмена».")
+
+
 @router.callback_query(F.data.startswith("idea:category:"))
 async def choose_idea_category(callback: CallbackQuery, state: FSMContext) -> None:
     idea_id = int(callback.data.split(":")[2])
@@ -1125,14 +1221,18 @@ async def capture_idea(message: Message, state: FSMContext, bot: Bot, db: Databa
     photo_file_id = None
     photo_path = None
     photo_ocr_text = None
+    photo_ai_text = None
     raw_text = (message.text or message.caption or "").strip()
     category_hint: str | None = None
 
     if message.photo:
         source_type = "photo"
-        status_message = await message.answer("Сохраняю фото и разбираю подпись...")
+        photo_caption = raw_text
+        status_message = await message.answer("Сохраняю фото и разбираю, что на нём...")
         photo_file_id, photo_path, photo_ocr_text = await save_photo_and_ocr(message, bot, config)
-        raw_text = merge_photo_text(raw_text, photo_ocr_text)
+        if photo_path:
+            photo_ai_text = await ai.describe_photo(Path(photo_path), photo_caption, photo_ocr_text)
+        raw_text = merge_photo_text(photo_caption, photo_ocr_text, photo_ai_text)
         await delete_status_message(status_message)
 
     if message.voice or message.audio:
@@ -1235,9 +1335,12 @@ async def capture_idea(message: Message, state: FSMContext, bot: Bot, db: Databa
             source_type = "link"
         raw_text = await enrich_link_text(raw_text)
 
-    analysis_status = await message.answer("Разбираю на карточки...")
+    analysis_status = await message.answer("Слушаю тебя и собираю мысль...")
     try:
-        payloads = await ai.structure_entries(raw_text, source_type, bool(photo_file_id))
+        if source_type == "photo" and not photo_has_text_context(message.caption or "", photo_ocr_text, photo_ai_text):
+            payloads = [ai.photo_without_text_payload(raw_text)]
+        else:
+            payloads = await ai.structure_entries(raw_text, source_type, bool(photo_file_id))
     except Exception:
         logger.exception("Idea structuring failed")
         payloads = [ai.raw_idea_payload(raw_text, category_hint)]
@@ -1257,6 +1360,7 @@ async def capture_idea(message: Message, state: FSMContext, bot: Bot, db: Databa
             photo_file_id,
             photo_path,
             photo_ocr_text,
+            photo_ai_text,
         )
         row = await db.get_idea(message.from_user.id, idea_id)
         if row:
@@ -1324,18 +1428,23 @@ async def main() -> None:
 
     logger.info("Ideas bot started")
     try:
-        await bot.set_my_commands(
-            [
-                BotCommand(command="start", description="Первый экран"),
-                BotCommand(command="list", description="Мысли"),
-                BotCommand(command="next", description="Следующие шаги"),
-                BotCommand(command="search", description="Поиск"),
-                BotCommand(command="album", description="Альбом фото"),
-                BotCommand(command="archive", description="Архив"),
-                BotCommand(command="help", description="Как это работает"),
-                BotCommand(command="settings", description="Настройки"),
-            ]
-        )
+        base_commands = [
+            BotCommand(command="start", description="Первый экран"),
+            BotCommand(command="list", description="Мысли"),
+            BotCommand(command="next", description="Продолжить мысль"),
+            BotCommand(command="search", description="Поиск"),
+            BotCommand(command="album", description="Альбом фото"),
+            BotCommand(command="archive", description="Архив"),
+            BotCommand(command="help", description="Как это работает"),
+            BotCommand(command="settings", description="Настройки"),
+        ]
+        admin_commands = [*base_commands, BotCommand(command="admin", description="Админка")]
+        await bot.set_my_commands(base_commands)
+        for admin_id in config.admin_ids:
+            try:
+                await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=admin_id))
+            except TelegramBadRequest as exc:
+                logger.info("Could not set admin command scope for %s: %s", admin_id, exc)
         await bot.delete_webhook(drop_pending_updates=True)
         await dp.start_polling(bot)
     finally:

@@ -47,6 +47,7 @@ class Config:
     default_digest_weekday: int
     default_digest_time: str
     groq_text_model: str
+    groq_vision_model: str
     groq_transcribe_model: str
     voice_transcriber: str
     short_input_char_limit: int
@@ -69,6 +70,8 @@ class Config:
     tesseract_binary: str = "tesseract"
     photo_ocr_language: str = "rus+eng"
     photo_ocr_timeout_seconds: int = 30
+    photo_vision_enabled: bool = True
+    photo_vision_timeout_seconds: int = 60
 
 
 def load_config() -> Config:
@@ -95,6 +98,7 @@ def load_config() -> Config:
         default_digest_weekday=int(os.getenv("DEFAULT_DIGEST_WEEKDAY", "6")),
         default_digest_time=os.getenv("DEFAULT_DIGEST_TIME", "19:00"),
         groq_text_model=os.getenv("GROQ_TEXT_MODEL", "qwen/qwen3-32b").strip(),
+        groq_vision_model=os.getenv("GROQ_VISION_MODEL", "meta-llama/llama-4-scout-17b-16e-instruct").strip(),
         groq_transcribe_model=os.getenv("GROQ_TRANSCRIBE_MODEL", "whisper-large-v3-turbo").strip(),
         voice_transcriber=os.getenv("VOICE_TRANSCRIBER", "faster_whisper").strip().lower(),
         short_input_char_limit=int(os.getenv("SHORT_INPUT_CHAR_LIMIT", "900")),
@@ -117,4 +121,6 @@ def load_config() -> Config:
         tesseract_binary=(os.getenv("TESSERACT_BINARY", "tesseract") or "tesseract").strip(),
         photo_ocr_language=(os.getenv("PHOTO_OCR_LANGUAGE", "rus+eng") or "rus+eng").strip(),
         photo_ocr_timeout_seconds=int(os.getenv("PHOTO_OCR_TIMEOUT_SECONDS", "30")),
+        photo_vision_enabled=_bool(os.getenv("PHOTO_VISION_ENABLED"), True),
+        photo_vision_timeout_seconds=int(os.getenv("PHOTO_VISION_TIMEOUT_SECONDS", "60")),
     )

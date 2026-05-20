@@ -3,15 +3,18 @@ from __future__ import annotations
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 
-def start_menu() -> InlineKeyboardMarkup:
+def start_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="➕ Добавить мысль", callback_data="nav:add"),
+            InlineKeyboardButton(text="💭 Мысли", callback_data="nav:list"),
+        ],
+        [InlineKeyboardButton(text="❓ Как это работает", callback_data="nav:how")],
+    ]
+    if is_admin:
+        rows.append([InlineKeyboardButton(text="🛡 Админка", callback_data="admin:menu")])
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="➕ Добавить мысль", callback_data="nav:add"),
-                InlineKeyboardButton(text="💭 Мысли", callback_data="nav:list"),
-            ],
-            [InlineKeyboardButton(text="❓ Как это работает", callback_data="nav:how")],
-        ]
+        inline_keyboard=rows
     )
 
 
@@ -19,7 +22,7 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [
             InlineKeyboardButton(text="💭 Мысли", callback_data="nav:list"),
-            InlineKeyboardButton(text="⚡ Следующие шаги", callback_data="nav:steps"),
+            InlineKeyboardButton(text="✍️ Продолжить мысль", callback_data="nav:steps"),
         ],
         [
             InlineKeyboardButton(text="🔍 Поиск", callback_data="nav:search"),
@@ -33,7 +36,7 @@ def main_menu(is_admin: bool = False) -> InlineKeyboardMarkup:
         ],
     ]
     if is_admin:
-        rows.append([InlineKeyboardButton(text="Админка", callback_data="admin:menu")])
+        rows.append([InlineKeyboardButton(text="🛡 Админка", callback_data="admin:menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -44,6 +47,18 @@ def idea_actions(idea_id: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="Подробнее", callback_data=f"idea:details:{idea_id}"),
                 InlineKeyboardButton(text="Архивировать", callback_data=f"idea:archive:{idea_id}"),
             ],
+        ]
+    )
+
+
+def next_step_actions(idea_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Продолжить", callback_data=f"idea:continue:{idea_id}"),
+                InlineKeyboardButton(text="Подробнее", callback_data=f"idea:details:{idea_id}"),
+            ],
+            [InlineKeyboardButton(text="Архивировать", callback_data=f"idea:archive:{idea_id}")],
         ]
     )
 

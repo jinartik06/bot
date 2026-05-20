@@ -26,6 +26,7 @@ def make_config(
         default_digest_weekday=6,
         default_digest_time="19:00",
         groq_text_model="qwen/qwen3-32b",
+        groq_vision_model="meta-llama/llama-4-scout-17b-16e-instruct",
         groq_transcribe_model="whisper-large-v3-turbo",
         voice_transcriber=voice_transcriber,
         short_input_char_limit=900,

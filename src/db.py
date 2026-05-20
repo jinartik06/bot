@@ -129,6 +129,7 @@ class Database:
                 photo_file_id TEXT,
                 photo_path TEXT,
                 photo_ocr_text TEXT,
+                photo_ai_text TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY(user_id) REFERENCES users(telegram_id) ON DELETE CASCADE,
@@ -167,6 +168,7 @@ class Database:
         await self.ensure_column("ideas", "archived_at", "TEXT")
         await self.ensure_column("ideas", "photo_path", "TEXT")
         await self.ensure_column("ideas", "photo_ocr_text", "TEXT")
+        await self.ensure_column("ideas", "photo_ai_text", "TEXT")
         await self.db.commit()
 
     async def ensure_column(self, table: str, column: str, definition: str) -> None:
@@ -421,6 +423,7 @@ class Database:
         photo_file_id: str | None,
         photo_path: str | None = None,
         photo_ocr_text: str | None = None,
+        photo_ai_text: str | None = None,
     ) -> int:
         category_id = await self.ensure_category(user_id, payload.get("category") or "Без категории")
         now = utc_now()
@@ -431,9 +434,10 @@ class Database:
                 tasks_json, open_questions_json, next_step, side_thoughts, category_id,
                 tags_json, original_text, source_type, priority_fire, pinned_at,
                 pinned_chat_id, pinned_message_id, photo_file_id, photo_path, photo_ocr_text,
+                photo_ai_text,
                 archived_at, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 user_id,
@@ -458,6 +462,7 @@ class Database:
                 photo_file_id,
                 photo_path,
                 photo_ocr_text,
+                photo_ai_text,
                 None,
                 now,
                 now,
@@ -555,12 +560,13 @@ class Database:
               AND (
                 i.title LIKE ? OR i.summary LIKE ? OR i.tldr LIKE ? OR
                 i.full_text LIKE ? OR i.original_text LIKE ? OR i.tags_json LIKE ? OR
-                i.next_step LIKE ? OR i.tasks_json LIKE ? OR i.photo_ocr_text LIKE ?
+                i.next_step LIKE ? OR i.tasks_json LIKE ? OR i.photo_ocr_text LIKE ? OR
+                i.photo_ai_text LIKE ?
               )
             ORDER BY i.created_at DESC
             LIMIT 20
             """,
-            (user_id, like, like, like, like, like, like, like, like, like),
+            (user_id, like, like, like, like, like, like, like, like, like, like),
         )
         return await cur.fetchall()
 
@@ -651,6 +657,7 @@ class Database:
             SET photo_file_id = NULL,
                 photo_path = NULL,
                 photo_ocr_text = NULL,
+                photo_ai_text = NULL,
                 updated_at = ?
             WHERE user_id = ? AND id = ?
             """,
@@ -708,7 +715,13 @@ class Database:
         )
         await self.db.commit()
 
-    async def update_idea_analysis(self, user_id: int, idea_id: int, payload: dict[str, Any]) -> None:
+    async def update_idea_analysis(
+        self,
+        user_id: int,
+        idea_id: int,
+        payload: dict[str, Any],
+        original_text: str | None = None,
+    ) -> None:
         await self.db.execute(
             """
             UPDATE ideas
@@ -723,6 +736,7 @@ class Database:
                 next_step = ?,
                 side_thoughts = ?,
                 tags_json = ?,
+                original_text = COALESCE(?, original_text),
                 updated_at = ?
             WHERE user_id = ? AND id = ?
             """,
@@ -738,6 +752,7 @@ class Database:
                 payload.get("next_step"),
                 payload.get("side_thoughts"),
                 dumps(payload.get("tags")),
+                original_text,
                 utc_now(),
                 user_id,
                 idea_id,
