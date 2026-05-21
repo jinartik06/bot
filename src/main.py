@@ -37,20 +37,24 @@ from .keyboards import (
     admin_menu,
     archived_idea_actions,
     categories_menu,
+    delete_idea_confirm_actions,
     idea_actions,
+    idea_details_actions,
     main_menu,
     next_step_actions,
     periods_menu,
     settings_menu,
     start_menu,
+    thoughts_list_actions,
 )
-from .render import album_caption, album_list_text, compact_list, digest_text, idea_details_text, idea_text, next_step_item_text, next_steps_text, period_since, start_text, usage_help
+from .render import album_caption, album_list_text, compact_list, digest_text, idea_details_text, idea_text, next_step_item_text, next_steps_text, period_since, start_text, thoughts_list_text, usage_help
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("ideas_bot")
 router = Router()
 VOICE_RUNTIME_LOCK = "voice_transcription"
+THOUGHTS_PAGE_SIZE = 10
 
 
 class Form(StatesGroup):
@@ -353,6 +357,32 @@ async def send_archived_idea(message: Message, row) -> None:
     await send_chunks(message, idea_text(row), reply_markup=archived_idea_actions(row["id"]))
 
 
+async def send_thoughts_list(message: Message, db: Database, user_id: int, page: int = 0, *, edit: bool = False) -> None:
+    page = max(0, page)
+    offset = page * THOUGHTS_PAGE_SIZE
+    rows = await db.list_ideas(user_id, THOUGHTS_PAGE_SIZE + 1, offset)
+    has_next = len(rows) > THOUGHTS_PAGE_SIZE
+    visible_rows = rows[:THOUGHTS_PAGE_SIZE]
+    if page > 0 and not visible_rows:
+        page = 0
+        offset = 0
+        rows = await db.list_ideas(user_id, THOUGHTS_PAGE_SIZE + 1, offset)
+        has_next = len(rows) > THOUGHTS_PAGE_SIZE
+        visible_rows = rows[:THOUGHTS_PAGE_SIZE]
+
+    text = thoughts_list_text(visible_rows, page)
+    markup = thoughts_list_actions(visible_rows, page, page > 0, has_next)
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=markup)
+            return
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return
+            logger.debug("Could not edit thoughts list, sending a new one: %s", exc)
+    await message.answer(text, reply_markup=markup)
+
+
 async def send_next_steps(message: Message, rows) -> None:
     if not rows:
         await message.answer(next_steps_text(rows))
@@ -548,12 +578,7 @@ async def help_cmd(message: Message) -> None:
 
 @router.message(Command("list", "thoughts"))
 async def list_cmd(message: Message, db: Database) -> None:
-    rows = await db.list_ideas(message.from_user.id, 20)
-    if not rows:
-        await message.answer("Пока мыслей нет.")
-        return
-    for row in rows:
-        await send_idea(message, row)
+    await send_thoughts_list(message, db, message.from_user.id)
 
 
 @router.message(Command("search"))
@@ -653,11 +678,14 @@ async def nav_how(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "nav:list")
 async def nav_list(callback: CallbackQuery, db: Database) -> None:
-    rows = await db.list_ideas(callback.from_user.id, 20)
-    if not rows:
-        await callback.message.answer("Пока мыслей нет.")
-    for row in rows:
-        await send_idea(callback.message, row)
+    await send_thoughts_list(callback.message, db, callback.from_user.id, edit=True)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("thoughts:page:"))
+async def thoughts_page(callback: CallbackQuery, db: Database) -> None:
+    page = int(callback.data.split(":")[2])
+    await send_thoughts_list(callback.message, db, callback.from_user.id, page, edit=True)
     await callback.answer()
 
 
@@ -832,7 +860,7 @@ async def show_details(callback: CallbackQuery, db: Database) -> None:
     idea_id = int(callback.data.split(":")[2])
     row = await db.get_idea(callback.from_user.id, idea_id)
     if row:
-        await send_chunks(callback.message, idea_details_text(row))
+        await send_chunks(callback.message, idea_details_text(row), reply_markup=idea_details_actions(idea_id))
     await callback.answer()
 
 
@@ -840,7 +868,11 @@ async def show_details(callback: CallbackQuery, db: Database) -> None:
 async def archive_idea(callback: CallbackQuery, db: Database) -> None:
     idea_id = int(callback.data.split(":")[2])
     await db.archive_idea(callback.from_user.id, idea_id)
-    await callback.message.edit_text("Запись убрана в архив.")
+    text = "Готово, мысль убрана из списка и лежит в архиве."
+    try:
+        await callback.message.edit_text(text)
+    except TelegramBadRequest:
+        await callback.message.answer(text)
     await callback.answer()
 
 
@@ -1030,11 +1062,37 @@ async def pin_idea(callback: CallbackQuery, bot: Bot, db: Database) -> None:
     await callback.answer("Закреплено")
 
 
-@router.callback_query(F.data.startswith("idea:delete:"))
-async def delete_idea(callback: CallbackQuery, db: Database) -> None:
+@router.callback_query(F.data.startswith("idea:delete_confirm:"))
+async def confirm_delete_idea(callback: CallbackQuery, db: Database) -> None:
     idea_id = int(callback.data.split(":")[2])
+    row = await db.get_idea(callback.from_user.id, idea_id)
+    if not row:
+        await callback.answer("Мысль уже удалена", show_alert=True)
+        return
+    await callback.message.answer(
+        f"Удалить мысль #{idea_id} навсегда?\n\n"
+        "Если нужно просто убрать её из списка, лучше нажать «Архивировать».",
+        reply_markup=delete_idea_confirm_actions(idea_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("idea:delete:"))
+async def delete_idea(callback: CallbackQuery, db: Database, config: Config) -> None:
+    idea_id = int(callback.data.split(":")[2])
+    row = await db.get_idea(callback.from_user.id, idea_id)
+    if not row:
+        await callback.answer("Мысль уже удалена", show_alert=True)
+        return
+    deleted_file = delete_local_photo(row["photo_path"], config)
     await db.delete_idea(callback.from_user.id, idea_id)
-    await callback.message.edit_text("Идея удалена.")
+    text = "Мысль удалена навсегда."
+    if deleted_file:
+        text += " Локальный файл фото тоже удалён."
+    try:
+        await callback.message.edit_text(text)
+    except TelegramBadRequest:
+        await callback.message.answer(text)
     await callback.answer()
 
 

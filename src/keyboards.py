@@ -51,6 +51,55 @@ def idea_actions(idea_id: int) -> InlineKeyboardMarkup:
     )
 
 
+def idea_details_actions(idea_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Продолжить", callback_data=f"idea:continue:{idea_id}"),
+                InlineKeyboardButton(text="Переименовать", callback_data=f"idea:rename:{idea_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Категория", callback_data=f"idea:category:{idea_id}"),
+                InlineKeyboardButton(text="Архивировать", callback_data=f"idea:archive:{idea_id}"),
+            ],
+            [
+                InlineKeyboardButton(text="Удалить", callback_data=f"idea:delete_confirm:{idea_id}"),
+                InlineKeyboardButton(text="К списку", callback_data="nav:list"),
+            ],
+        ]
+    )
+
+
+def delete_idea_confirm_actions(idea_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да, удалить", callback_data=f"idea:delete:{idea_id}"),
+                InlineKeyboardButton(text="Оставить", callback_data=f"idea:details:{idea_id}"),
+            ],
+        ]
+    )
+
+
+def thoughts_list_actions(rows: list, page: int, has_previous: bool, has_next: bool) -> InlineKeyboardMarkup:
+    keyboard = []
+    for row in rows:
+        title = " ".join(str(row["title"]).split())
+        if len(title) > 34:
+            title = title[:31].rstrip() + "..."
+        keyboard.append([InlineKeyboardButton(text=f"#{row['id']} {title}", callback_data=f"idea:details:{row['id']}")])
+
+    navigation = []
+    if has_previous:
+        navigation.append(InlineKeyboardButton(text="← Назад", callback_data=f"thoughts:page:{page - 1}"))
+    if has_next:
+        navigation.append(InlineKeyboardButton(text="Вперёд →", callback_data=f"thoughts:page:{page + 1}"))
+    if navigation:
+        keyboard.append(navigation)
+    keyboard.append([InlineKeyboardButton(text="Главное меню", callback_data="nav:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=keyboard)
+
+
 def next_step_actions(idea_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[

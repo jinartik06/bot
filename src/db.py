@@ -521,7 +521,7 @@ class Database:
             (user_id, idea_id),
         )
 
-    async def list_ideas(self, user_id: int, limit: int = 10) -> list[aiosqlite.Row]:
+    async def list_ideas(self, user_id: int, limit: int = 10, offset: int = 0) -> list[aiosqlite.Row]:
         cur = await self.db.execute(
             """
             SELECT i.*, c.name AS category
@@ -529,9 +529,9 @@ class Database:
             LEFT JOIN categories c ON c.id = i.category_id
             WHERE i.user_id = ? AND i.archived_at IS NULL
             ORDER BY i.created_at DESC
-            LIMIT ?
+            LIMIT ? OFFSET ?
             """,
-            (user_id, limit),
+            (user_id, limit, max(0, offset)),
         )
         return await cur.fetchall()
 

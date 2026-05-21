@@ -7,9 +7,9 @@ from tempfile import TemporaryDirectory
 from src.ai import IdeaAI
 from src.config import Config
 from src.db import Database
-from src.keyboards import main_menu, next_step_actions, start_menu
+from src.keyboards import delete_idea_confirm_actions, idea_details_actions, main_menu, next_step_actions, start_menu, thoughts_list_actions
 from src.main import build_continuation_text, category_name_from_chat_text, delete_local_photo, merge_photo_text, parse_admin_user_input, photo_has_text_context, safe_photo_name, split_category_hint
-from src.render import next_step_item_text, next_steps_text
+from src.render import idea_text, next_step_item_text, next_steps_text, thoughts_list_text
 
 
 def make_config() -> Config:
@@ -140,6 +140,61 @@ class CaptureHelperTests(unittest.TestCase):
         self.assertIn("✍️ Продолжить мысль", menu_texts)
         self.assertIn("Продолжить мысль", next_steps_text([{"id": 1}]))
         self.assertIn("Пока нет мыслей", next_steps_text([]))
+
+    def test_card_uses_warm_russian_summary_label(self) -> None:
+        text = idea_text(
+            {
+                "entry_type": "Идея",
+                "title": "Новая мысль",
+                "summary": "Сделать бот теплее.",
+                "tldr": None,
+                "full_text": None,
+                "original_text": "Сделать бот теплее.",
+                "next_step": None,
+            }
+        )
+
+        self.assertIn("Коротко", text)
+        self.assertNotIn("Summary", text)
+
+    def test_thoughts_list_uses_single_screen_with_open_buttons(self) -> None:
+        rows = [
+            {
+                "id": 7,
+                "entry_type": "Идея",
+                "title": "Длинная мысль про список без дублей",
+                "summary": "Показывать один экран.",
+                "tldr": None,
+                "full_text": None,
+                "original_text": "Показывать один экран.",
+            }
+        ]
+
+        text = thoughts_list_text(rows)
+        markup = thoughts_list_actions(rows, page=0, has_previous=False, has_next=True)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+
+        self.assertIn("Мысли", text)
+        self.assertIn("#7", text)
+        self.assertIn("idea:details:7", callbacks)
+        self.assertIn("thoughts:page:1", callbacks)
+
+    def test_idea_details_exposes_edit_archive_and_delete_actions(self) -> None:
+        markup = idea_details_actions(9)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+
+        self.assertIn("idea:continue:9", callbacks)
+        self.assertIn("idea:rename:9", callbacks)
+        self.assertIn("idea:category:9", callbacks)
+        self.assertIn("idea:archive:9", callbacks)
+        self.assertIn("idea:delete_confirm:9", callbacks)
+
+    def test_delete_confirmation_is_separate_from_delete_action(self) -> None:
+        markup = delete_idea_confirm_actions(9)
+        callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+
+        self.assertIn("idea:delete:9", callbacks)
+        self.assertIn("idea:details:9", callbacks)
 
     def test_next_step_item_text_shows_action_items(self) -> None:
         text = next_step_item_text(
@@ -321,6 +376,69 @@ class ProcessedMessageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(steps, [])
         self.assertEqual(len(archived), 1)
         self.assertIsNotNone(archived[0]["archived_at"])
+
+    async def test_delete_idea_removes_it_permanently(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "ideas.db")
+            await db.connect()
+            try:
+                await db.upsert_user(10, "user", "User", "Europe/Moscow", 6, "19:00")
+                idea_id = await db.create_idea(
+                    10,
+                    {
+                        "type": "Мысль",
+                        "title": "Лишняя мысль",
+                        "summary": "Можно удалить.",
+                        "tasks": [],
+                        "category": "Личное",
+                        "key_points": [],
+                        "open_questions": [],
+                        "tags": [],
+                    },
+                    "Лишняя мысль",
+                    "text",
+                    None,
+                )
+                await db.delete_idea(10, idea_id)
+                row = await db.get_idea(10, idea_id)
+                ideas = await db.list_ideas(10)
+            finally:
+                await db.close()
+
+        self.assertIsNone(row)
+        self.assertEqual(ideas, [])
+
+    async def test_list_ideas_supports_pagination_without_losing_old_items(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            db = Database(Path(tmpdir) / "ideas.db")
+            await db.connect()
+            try:
+                await db.upsert_user(10, "user", "User", "Europe/Moscow", 6, "19:00")
+                for index in range(12):
+                    await db.create_idea(
+                        10,
+                        {
+                            "type": "Мысль",
+                            "title": f"Мысль {index}",
+                            "summary": f"Коротко {index}",
+                            "tasks": [],
+                            "category": "Личное",
+                            "key_points": [],
+                            "open_questions": [],
+                            "tags": [],
+                        },
+                        f"Текст {index}",
+                        "text",
+                        None,
+                    )
+                first_page = await db.list_ideas(10, 10, 0)
+                second_page = await db.list_ideas(10, 10, 10)
+            finally:
+                await db.close()
+
+        self.assertEqual(len(first_page), 10)
+        self.assertEqual(len(second_page), 2)
+        self.assertNotEqual({row["id"] for row in first_page}, {row["id"] for row in second_page})
 
     async def test_album_lists_and_removes_uploaded_photo(self) -> None:
         with TemporaryDirectory() as tmpdir:

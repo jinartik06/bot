@@ -102,6 +102,19 @@ def compact_list(rows) -> str:
     return "\n\n".join(lines)
 
 
+def thoughts_list_text(rows, page: int = 0) -> str:
+    if not rows:
+        return "Пока мыслей нет. Просто отправь сюда текст, голосовое, фото или ссылку."
+    title = hbold("Мысли") if page == 0 else f"{hbold('Мысли')} · страница {page + 1}"
+    lines = [title, "Открой нужную мысль кнопкой ниже."]
+    for row in rows:
+        summary = summary_for_card(row)
+        lines.extend(["", f"#{row['id']} {TYPE_EMOJI.get(entry_type(row), '🧠')} {quote_html(row['title'])}"])
+        if summary:
+            lines.append(hitalic(summary))
+    return "\n".join(lines)
+
+
 def next_steps_text(rows) -> str:
     if not rows:
         return "Пока нет мыслей, которые хочется продолжить."
